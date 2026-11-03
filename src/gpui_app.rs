@@ -1608,7 +1608,6 @@ impl MainView {
                         self.capture_window_key = Some(key);
                     }
                     }
-                    }
                 }
             }
         }
