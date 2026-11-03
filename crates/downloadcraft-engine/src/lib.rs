@@ -15,8 +15,8 @@
 //!   proves the server supports ranges.
 //! - **One pre-allocated file.** Every connection writes at its own offset, so
 //!   there is no merge pass at the end (sparse on Windows: no zero-fill).
-//! - **Crash-safe resume.** A journal of the missing ranges is rewritten every
-//!   few seconds after the data is flushed; any number of connections can
+//! - **Crash-safe resume.** A journal of the missing ranges is rewritten at
+//!   most once per second after the data is flushed; any number of connections can
 //!   continue it, and a changed server file is detected (size, ETag,
 //!   Last-Modified) instead of being stitched onto old bytes.
 //! - **Self-healing connections.** Throttling (429/503) lowers the connection
@@ -93,7 +93,9 @@ pub struct Config {
     /// Give up after this many failed attempts in a row with no progress
     /// anywhere. Default 8.
     pub max_retries: u32,
-    /// How often the resume journal is saved. Default 3 s.
+    /// Legacy tuning field retained for compatibility. Periodic checkpoints
+    /// use a fixed one-second ceiling; pause and worker termination can save
+    /// sooner so this value cannot cause journal writes faster than 1 Hz.
     pub journal_interval: Duration,
     /// Flush data to disk before each journal save (crash safety at the
     /// cost of some disk syncs). Default true.
@@ -105,7 +107,7 @@ pub struct Config {
     /// Fail when the server sends an HTML page instead of the file (unless
     /// the destination itself is `.html`/`.htm`). Default true.
     pub reject_html: bool,
-    /// Bytes buffered per connection before a disk write. Default 512 KiB.
+    /// Bytes buffered per connection before a disk write. Default 256 KiB.
     pub write_buffer: usize,
 }
 
@@ -117,12 +119,12 @@ impl Default for Config {
             max_request: None,
             stall_timeout: Duration::from_secs(30),
             max_retries: 8,
-            journal_interval: Duration::from_secs(3),
+            journal_interval: Duration::from_secs(1),
             durable: true,
             slow_restart_after: Some(Duration::from_secs(15)),
             slow_ratio: 0.2,
             reject_html: true,
-            write_buffer: 512 * 1024,
+            write_buffer: 256 * 1024,
         }
     }
 }
@@ -189,29 +191,113 @@ impl Job {
 }
 
 /// Pause, resume or stop a running download from any thread.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Control {
     paused: AtomicBool,
     cancelled: AtomicBool,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    pause_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for Control {
+    fn default() -> Self {
+        let (cancel_tx, _) = tokio::sync::watch::channel(false);
+        let (pause_tx, _) = tokio::sync::watch::channel(false);
+        Self {
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            cancel_tx,
+            pause_tx,
+        }
+    }
 }
 
 impl Control {
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
+        self.pause_tx.send_replace(true);
     }
     pub fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
+        self.pause_tx.send_replace(false);
     }
     /// Stop: the download returns [`Error::Cancelled`] and keeps its resume
     /// state, so running the same job again continues it.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.cancel_tx.send_replace(true);
+        // Wake any operation waiting for resume; it will observe cancellation
+        // immediately after the wait returns.
+        self.pause_tx.send_replace(true);
     }
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let mut rx = self.cancel_tx.subscribe();
+        if *rx.borrow() {
+            return;
+        }
+        let _ = rx.changed().await;
+    }
+
+    /// Interrupt a network read or request when pause is requested. The
+    /// second state check closes the race between the initial check and
+    /// subscribing to the watch channel.
+    pub(crate) async fn pause_changed(&self) {
+        if self.is_paused() || self.is_cancelled() {
+            return;
+        }
+        let mut rx = self.pause_tx.subscribe();
+        if self.is_paused() || self.is_cancelled() {
+            return;
+        }
+        let _ = rx.changed().await;
+    }
+
+    /// Sleep without polling until the job is resumed or cancelled.
+    pub(crate) async fn wait_until_resumed(&self) {
+        let mut rx = self.pause_tx.subscribe();
+        loop {
+            if !self.is_paused() || self.is_cancelled() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::Control;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancel_wakes_all_waiters_promptly() {
+        let control = Arc::new(Control::default());
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let control = control.clone();
+            waiters.push(tokio::spawn(async move { control.cancelled().await }));
+        }
+        tokio::task::yield_now().await;
+        control.cancel();
+        for waiter in waiters {
+            tokio::time::timeout(Duration::from_millis(100), waiter)
+                .await
+                .expect("cancellation wake should not depend on the polling interval")
+                .expect("waiter task should finish");
+        }
     }
 }
 

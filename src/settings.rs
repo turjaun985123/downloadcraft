@@ -747,7 +747,7 @@ fn pick_ffmpeg() -> Option<std::path::PathBuf> {
 }
 
 fn install_one(browser: &str) -> String {
-    match crate::app::install_native_host(browser) {
+    match crate::integration::install_native_host(browser) {
         Ok(manifest) => format!("Installed {browser} host ✓ ({manifest})"),
         Err(e) => format!("Install failed: {e}"),
     }
@@ -865,8 +865,8 @@ impl eframe::App for SettingsApp {
             if let Ok(res) = rx.try_recv() {
                 self.deno_rx = None;
                 self.ytdlp_msg = match res {
-                    Ok(_) => "JavaScript runtime installed (Deno) — YouTube's player challenges are solved now.".into(),
-                    Err(e) => format!("Could not install the JavaScript runtime: {e}"),
+                    Ok(_) => "Deno installed — YouTube's player challenges are solved now.".into(),
+                    Err(e) => format!("Could not install Deno: {e}"),
                 };
                 // Re-read the status so the Runtime chip shows it.
                 if self.ytdlp_rx.is_none() {
@@ -2523,7 +2523,7 @@ fn loc_status(ui: &mut Ui, text: &str, warn: bool) {
     });
 }
 
-/// `.runtime-note`: "Runtime `node` — solves YouTube's player challenge",
+/// `.runtime-note`: "Runtime `deno` — solves YouTube's player challenge",
 /// right-aligned in the action row.
 fn runtime_note(ui: &mut Ui, runtime: Option<&str>) {
     let t = tok();
@@ -2543,7 +2543,7 @@ fn runtime_note(ui: &mut Ui, runtime: Option<&str>) {
 fn runtime_tail(runtime: Option<&str>) -> (&'static str, bool) {
     match runtime {
         Some(_) => ("— solves YouTube's player challenge", false),
-        None => ("— needs Node.js 22+ or Deno 2.3+", true),
+        None => ("— install Deno 2.3+ for YouTube challenges", true),
     }
 }
 
@@ -3253,11 +3253,11 @@ impl SettingsApp {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             let label = if own {
-                                "Update JavaScript runtime"
+                                "Update Deno"
                             } else if rt.is_some() {
-                                "Install app's own runtime"
+                                "Install app-managed Deno"
                             } else {
-                                "Install JavaScript runtime"
+                                "Install Deno"
                             };
                             let b = ui.add_enabled_ui(!installing, |ui| btn_icon(ui, "\u{e2c4}", label, rt.is_none() && !own)).inner;
                             if b.on_hover_text("Downloads a portable Deno (about 45 MB) next to yt-dlp — nothing else to set up").clicked() {
@@ -3266,7 +3266,7 @@ impl SettingsApp {
                                     let _ = tx.send(crate::engine::deno_install_blocking().map_err(|e| format!("{e:#}")));
                                 });
                                 self.deno_rx = Some(rx);
-                                self.ytdlp_msg = "Installing the JavaScript runtime (Deno)…".into();
+                                self.ytdlp_msg = "Installing Deno…".into();
                             }
                             if installing {
                                 ui.add(egui::Spinner::new().size(14.0));
@@ -3643,13 +3643,13 @@ impl SettingsApp {
             let probe = || -> Vec<(&'static str, bool)> {
                 ["chrome", "edge", "brave", "opera", "firefox"]
                     .iter()
-                    .map(|b| (*b, crate::app::native_host_status(b)))
+                    .map(|b| (*b, crate::integration::native_host_status(b)))
                     .collect()
             };
             let mut status = probe();
             if status.iter().any(|(_, ok)| !ok) {
                 for (b, _) in status.iter().filter(|(_, ok)| !ok) {
-                    let _ = crate::app::install_native_host(b);
+                    let _ = crate::integration::install_native_host(b);
                 }
                 status = probe();
             }
@@ -3779,7 +3779,7 @@ impl SettingsApp {
                         if !firefox {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(format!("ID  {}", crate::app::EXTENSION_ID))
+                                    egui::RichText::new(format!("ID  {}", crate::integration::EXTENSION_ID))
                                         .font(egui::FontId::monospace(9.0))
                                         .color(t.muted),
                                 )
@@ -3831,7 +3831,7 @@ impl SettingsApp {
             }
         }
         if copy_id {
-            ui.ctx().copy_text(crate::app::EXTENSION_ID.to_string());
+            ui.ctx().copy_text(crate::integration::EXTENSION_ID.to_string());
             self.browser_msg = "Extension ID copied.".to_string();
         }
         if let Some(b) = repair {

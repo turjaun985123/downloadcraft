@@ -83,6 +83,8 @@ fn read_item(id: u64) -> Option<DownloadItem> {
     items.into_iter().find(|d| d.id == id)
 }
 
+pub(crate) use crate::complete_service::{gpui_item, gpui_open_with};
+
 /// Close bulletproofing: viewport Close is async and has been observed to
 /// no-op; back it with a delayed process exit (harmless if the window already
 /// closed). Dropping the claim file happens in the OS, so it is safe either
@@ -364,7 +366,7 @@ fn dlg_btn(p: &egui::Painter, r: egui::Rect, hov: bool, label: &str) {
 fn open_with(path: &std::path::Path) {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("rundll32.exe")
+        let _ = crate::platform::silent_command("rundll32.exe")
             .arg("shell32.dll,OpenAs_RunDLL")
             .arg(path)
             .spawn();

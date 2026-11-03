@@ -2,7 +2,7 @@
 name = "download_craft"
 version = "0.9.13"
 edition = "2021"
-description = "Download Craft — a lightweight, offline-first download manager (egui GUI + CLI)"
+description = "Download Craft — a lightweight, offline-first Rust download manager with GUI and CLI"
 license = "MIT"
 
 [profile.release]
@@ -15,10 +15,14 @@ strip = true
 [workspace]
 members = [".", "crates/downloadcraft-engine"]
 
+[features]
+default = ["gpui-ui"]
+# Native Rust desktop frontend.
+gpui-ui = ["dep:gpui"]
+
 [dependencies]
 downloadcraft-engine = { path = "crates/downloadcraft-engine", version = "0.1.0" }
-eframe = "0.32"
-egui = "0.32"
+gpui = { version = "=0.2.2", optional = true }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "json", "http2", "socks"] }
 md-5 = "0.10"

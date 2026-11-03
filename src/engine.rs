@@ -6,6 +6,37 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// Shared state between the UI thread and the download task.
+///
+/// The UI still reads and writes this like an atomic boolean, while async
+/// network paths subscribe to changes so Pause can stop polling an in-flight
+/// future without waiting for an arbitrary timer tick.
+pub struct PauseFlag {
+    value: AtomicBool,
+    changed: tokio::sync::watch::Sender<u64>,
+}
+
+impl PauseFlag {
+    fn new() -> Self {
+        let (changed, _) = tokio::sync::watch::channel(0);
+        Self { value: AtomicBool::new(false), changed }
+    }
+
+    pub fn load(&self, order: Ordering) -> bool {
+        self.value.load(order)
+    }
+
+    pub fn store(&self, value: bool, order: Ordering) {
+        let old = self.value.swap(value, order);
+        if old != value {
+            self.changed.send_modify(|version| *version = version.wrapping_add(1));
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+}
+
 pub struct SharedState {
     pub downloaded: AtomicU64,
     pub total: AtomicU64,
@@ -17,8 +48,9 @@ pub struct SharedState {
     /// 0 by the built-in engine, which lets the UI measure the rate from the
     /// byte counter instead.
     pub speed_bps: AtomicU64,
-    pub paused: AtomicBool,
+    pub paused: PauseFlag,
     pub cancelled: AtomicBool,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
     /// Set only after the engine and all final validation have succeeded.
     pub succeeded: AtomicBool,
     /// External tools pause by stopping and restarting from their partial files.
@@ -66,6 +98,7 @@ pub struct SharedState {
 
 impl SharedState {
     pub fn new() -> Self {
+        let (cancel_tx, _) = tokio::sync::watch::channel(false);
         Self {
             downloaded: AtomicU64::new(0),
             total: AtomicU64::new(0),
@@ -73,8 +106,9 @@ impl SharedState {
             expected_duration: AtomicU64::new(0),
             expects_audio: AtomicBool::new(false),
             speed_bps: AtomicU64::new(0),
-            paused: AtomicBool::new(false),
+            paused: PauseFlag::new(),
             cancelled: AtomicBool::new(false),
+            cancel_tx,
             succeeded: AtomicBool::new(false),
             external_helper: AtomicBool::new(false),
             resolved_name: std::sync::Mutex::new(None),
@@ -91,6 +125,22 @@ impl SharedState {
             frag_count: AtomicU64::new(0),
             ytdlp_tried: AtomicBool::new(false),
         }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancel_tx.send_replace(true);
+    }
+
+    pub async fn cancelled(&self) {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut receiver = self.cancel_tx.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        let _ = receiver.changed().await;
     }
 
     /// Set the current stage label (see [`SharedState::phase`]).
@@ -166,6 +216,44 @@ pub(crate) fn io_message(e: &std::io::Error) -> String {
     format!("file error: {e}")
 }
 
+/// The exact host a captured credential belongs to. A credential is never
+/// sent to another host, even one on the same registrable site: a manifest or
+/// segment that points at a different host gets no cookie, and a cookie
+/// captured over HTTPS is never sent over plain HTTP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialScope {
+    host: String,
+    secure_only: bool,
+}
+
+impl CredentialScope {
+    /// Scope for a credential captured from `url`. Invalid URLs and hosts
+    /// without a name yield `None`; callers must treat "no scope" as
+    /// "credential unusable" (fail closed).
+    pub fn for_url(url: &str) -> Option<Self> {
+        let u = reqwest::Url::parse(url).ok()?;
+        let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() || host.contains(['\r', '\n', '\0']) {
+            return None;
+        }
+        Some(Self { host, secure_only: u.scheme() == "https" })
+    }
+
+    /// The exact host this credential may be sent to.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Whether `url` is inside this credential's boundary.
+    pub fn allows(&self, url: &str) -> bool {
+        let Ok(u) = reqwest::Url::parse(url) else { return false };
+        if self.secure_only && u.scheme() != "https" {
+            return false;
+        }
+        u.host_str().is_some_and(|h| h.trim_end_matches('.').eq_ignore_ascii_case(&self.host))
+    }
+}
+
 /// Per-download + global options for the engine.
 #[derive(Debug, Clone)]
 pub struct EngineOpts {
@@ -175,6 +263,10 @@ pub struct EngineOpts {
     pub user_agent: String,
     pub referer: String,
     pub cookie: String,
+    /// Host the cookie was captured from. The cookie is sent only to that
+    /// host; an unscoped cookie is never sent (fail closed). Build it with
+    /// [`CredentialScope::for_url`].
+    pub cookie_scope: Option<CredentialScope>,
     pub username: String,
     pub password: String,
     pub proxy_url: String,
@@ -324,27 +416,27 @@ async fn learn_digest(client: &reqwest::Client, opts: &EngineOpts, url: &str) {
 }
 
 /// Request headers captured by the extension for one download. They are
-/// sent only to the site they were captured from, never to unrelated hosts a
-/// playlist or redirect points at (bearer tokens must not leak).
+/// sent only to the exact host they were captured from, never to unrelated
+/// hosts a playlist or redirect points at (bearer tokens must not leak).
 #[derive(Debug, Clone, Default)]
 pub struct CapturedHeaders {
-    site: String,
+    host: String,
     headers: Vec<(String, String)>,
 }
 
 impl CapturedHeaders {
     pub fn for_url(url: &str, headers: &std::collections::BTreeMap<String, String>) -> Self {
-        let Some(site) = site_of_url(url) else { return Self::default() };
+        let Some(host) = host_of_url(url) else { return Self::default() };
         let headers: Vec<(String, String)> = headers
             .iter()
             .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
             .filter(|(k, v)| replayable_header(k) && !v.is_empty() && !v.contains(['\r', '\n']))
             .collect();
-        if headers.is_empty() { Self::default() } else { Self { site, headers } }
+        if headers.is_empty() { Self::default() } else { Self { host, headers } }
     }
 
     fn applies_to(&self, url: &str) -> bool {
-        !self.headers.is_empty() && site_of_url(url).as_deref() == Some(self.site.as_str())
+        !self.headers.is_empty() && host_of_url(url).as_deref() == Some(self.host.as_str())
     }
 }
 
@@ -353,6 +445,28 @@ impl CapturedHeaders {
 /// headers are the engine's own business.
 pub fn replayable_header(name: &str) -> bool {
     name == "origin" || name == "authorization" || (name.starts_with("x-") && name != "x-client-data")
+}
+
+/// Exact, lower-case host of a URL (a trailing root dot is removed). This is
+/// the credential boundary: `api.example.com` and `evil.example.com` are two
+/// different hosts even though they share a registrable site.
+pub(crate) fn host_of_url(url: &str) -> Option<String> {
+    let host = reqwest::Url::parse(url).ok()?.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty() && !host.contains(['\r', '\n', '\0'])).then_some(host)
+}
+
+/// The referer safe to send to `url`: unchanged when both URLs share a host
+/// (or the destination is not a URL), otherwise the captured referer with its
+/// query and fragment removed so signed page tokens cannot leak to a CDN.
+fn referer_for(referer: &str, url: Option<&str>) -> String {
+    let Some(dest) = url.and_then(host_of_url) else { return referer.to_string() };
+    let Ok(mut r) = reqwest::Url::parse(referer) else { return referer.to_string() };
+    if r.host_str().is_some_and(|h| h.trim_end_matches('.').eq_ignore_ascii_case(&dest)) {
+        return referer.to_string();
+    }
+    r.set_query(None);
+    r.set_fragment(None);
+    r.to_string()
 }
 
 /// Registrable site of a URL's host ("a.b.example.co.uk" -> "example.co.uk",
@@ -392,6 +506,7 @@ impl Default for EngineOpts {
             user_agent: String::new(),
             referer: String::new(),
             cookie: String::new(),
+            cookie_scope: None,
             username: String::new(),
             password: String::new(),
             proxy_url: String::new(),
@@ -555,16 +670,16 @@ impl EngineOpts {
         // Captured headers ride on every request, and on a redirect reqwest
         // strips only Authorization/Cookie: an x-* token or Origin would
         // follow a redirect to any host. Refuse redirects that leave the
-        // captured site instead (the browser already resolved its own).
+        // captured host instead (the browser already resolved its own).
         let redirect = match self.captured_headers.headers.is_empty() {
             true => reqwest::redirect::Policy::limited(10),
             false => {
-                let site = self.captured_headers.site.clone();
+                let host = self.captured_headers.host.clone();
                 reqwest::redirect::Policy::custom(move |attempt| {
                     if attempt.previous().len() >= 10 {
                         attempt.error("too many redirects")
-                    } else if site_of_url(attempt.url().as_str()).as_deref() != Some(site.as_str()) {
-                        attempt.error("redirected to another site while carrying captured browser headers; capture the video again from its page")
+                    } else if host_of_url(attempt.url().as_str()).as_deref() != Some(host.as_str()) {
+                        attempt.error("redirected to another host while carrying captured browser headers; capture the video again from its page")
                     } else {
                         attempt.follow()
                     }
@@ -717,9 +832,14 @@ impl EngineOpts {
             }
         }
         if !referer.is_empty() {
-            r = r.header(reqwest::header::REFERER, referer);
+            r = r.header(reqwest::header::REFERER, referer_for(&referer, url));
         }
-        if !self.cookie.trim().is_empty() {
+        // A cookie is only ever sent back to the exact host it was captured
+        // from. No scope (legacy caller) or a different host means no cookie:
+        // a playlist that points at another origin must not receive it.
+        if !self.cookie.trim().is_empty()
+            && url.is_some_and(|u| self.cookie_scope.as_ref().is_some_and(|s| s.allows(u)))
+        {
             r = r.header(reqwest::header::COOKIE, self.cookie.trim().to_string());
         }
         if url.is_some_and(|u| self.captured_headers.applies_to(u)) {
@@ -772,7 +892,8 @@ fn client_hint_platform(ua: &str) -> &'static str {
     else { "Unknown" }
 }
 
-pub(crate) async fn wait_if_paused(shared: &Arc<SharedState>) -> Result<()> {
+pub(crate) async fn wait_if_paused(shared: &SharedState) -> Result<()> {
+    let mut pause_changes = shared.paused.subscribe();
     loop {
         if shared.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("cancelled"));
@@ -780,7 +901,32 @@ pub(crate) async fn wait_if_paused(shared: &Arc<SharedState>) -> Result<()> {
         if !shared.paused.load(Ordering::SeqCst) {
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::select! {
+            _ = shared.cancelled() => return Err(anyhow!("cancelled")),
+            _ = pause_changes.changed() => {},
+        }
+    }
+}
+
+pub(crate) async fn until_cancel<T>(
+    shared: &SharedState,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::pin!(future);
+    let mut pause_changes = shared.paused.subscribe();
+    loop {
+        if shared.cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("cancelled"));
+        }
+        if shared.paused.load(Ordering::SeqCst) {
+            wait_if_paused(shared).await?;
+            continue;
+        }
+        tokio::select! {
+            _ = shared.cancelled() => return Err(anyhow!("cancelled")),
+            _ = pause_changes.changed() => {},
+            result = &mut future => return Ok(result),
+        }
     }
 }
 
@@ -1428,6 +1574,18 @@ pub async fn probe(
         return (None, false, None, disp);
     }
     (None, false, None, None)
+}
+
+/// The UI-facing probe intentionally has no job state; downloads use this
+/// wrapper so HEAD/Range probing and any Drive handoff obey the same pause
+/// and cancellation state as the transfer that follows.
+async fn probe_live(
+    client: &reqwest::Client,
+    opts: &EngineOpts,
+    url: &str,
+    shared: &SharedState,
+) -> Result<(Option<u64>, bool, Option<String>, Option<String>)> {
+    until_cancel(shared, probe(client, opts, url)).await
 }
 
 /// One-shot Range check for expiring signed CDN links: a single
@@ -3344,37 +3502,33 @@ async fn download_hls(
     }
     // 1. Master playlist?
     let mut pl_url = playlist_url.to_string();
-    let mut text = opts
-        .get(&client, &pl_url)
-        .send()
-        .await
+    let response = until_cancel(shared.as_ref(), opts.get(&client, &pl_url).send())
+        .await?
         .map_err(|e| anyhow!("playlist fetch: {e}"))?
         .error_for_status()
-        .map_err(|e| anyhow!("playlist HTTP: {e}"))?
-        .text()
-        .await
+        .map_err(|e| anyhow!("playlist HTTP: {e}"))?;
+    let mut text = until_cancel(shared.as_ref(), response.text())
+        .await?
         .map_err(|e| anyhow!("playlist read: {e}"))?;
     let external_audio = hls_external_audio(&text);
     if external_audio || text.contains("#EXT-X-BYTERANGE") || text.contains("BYTERANGE=") {
         if external_audio { shared.expects_audio.store(true, Ordering::SeqCst); }
         let mut helper_opts = opts.clone();
         helper_opts.require_audio |= external_audio;
-        let exe = ensure_ytdlp(&client).await?;
+        let exe = until_cancel(shared.as_ref(), ensure_ytdlp(&client)).await??;
         return download_with_ytdlp(&exe, playlist_url, dest, connections, &helper_opts, shared).await;
     }
     if text.contains("#EXT-X-STREAM-INF") {
         pl_url = hls_pick_variant(&text, &pl_url).ok_or_else(|| {
             anyhow!("could not pick a variant from this master playlist — use the extension MP4 qualities")
         })?;
-        text = opts
-            .get(&client, &pl_url)
-            .send()
-            .await
+        let response = until_cancel(shared.as_ref(), opts.get(&client, &pl_url).send())
+            .await?
             .map_err(|e| anyhow!("variant fetch: {e}"))?
             .error_for_status()
-            .map_err(|e| anyhow!("variant HTTP: {e}"))?
-            .text()
-            .await
+            .map_err(|e| anyhow!("variant HTTP: {e}"))?;
+        text = until_cancel(shared.as_ref(), response.text())
+            .await?
             .map_err(|e| anyhow!("variant read: {e}"))?;
     }
     if text.contains("#EXT-X-ENDLIST") {
@@ -3421,15 +3575,13 @@ async fn download_hls(
     let mut key_map: std::collections::HashMap<String, [u8; 16]> =
         std::collections::HashMap::new();
     for uri in &distinct {
-        let kb = opts
-            .get(&client, uri)
-            .send()
-            .await
+        let response = until_cancel(shared.as_ref(), opts.get(&client, uri).send())
+            .await?
             .map_err(|e| anyhow!("key fetch: {e}"))?
             .error_for_status()
-            .map_err(|e| anyhow!("key HTTP: {e}"))?
-            .bytes()
-            .await
+            .map_err(|e| anyhow!("key HTTP: {e}"))?;
+        let kb = until_cancel(shared.as_ref(), response.bytes())
+            .await?
             .map_err(|e| anyhow!("key read: {e}"))?;
         if kb.len() != 16 {
             return Err(anyhow!("HLS key is not 16 bytes — refusing"));
@@ -3445,15 +3597,13 @@ async fn download_hls(
     // at merge time. Re-fetched on resume (tiny); counted in progress.
     let init_bytes: Option<Vec<u8>> = match hls_map_init(&text, &pl_url)? {
         Some(u) => {
-            let blob = opts
-                .get(&client, &u)
-                .send()
-                .await
+            let response = until_cancel(shared.as_ref(), opts.get(&client, &u).send())
+                .await?
                 .map_err(|e| anyhow!("init fetch: {e}"))?
                 .error_for_status()
-                .map_err(|e| anyhow!("init HTTP: {e}"))?
-                .bytes()
-                .await
+                .map_err(|e| anyhow!("init HTTP: {e}"))?;
+            let blob = until_cancel(shared.as_ref(), response.bytes())
+                .await?
                 .map_err(|e| anyhow!("init read: {e}"))?;
             if blob.is_empty() {
                 return Err(anyhow!("HLS init section is empty — refusing"));
@@ -3585,8 +3735,10 @@ async fn download_hls(
         let seg_key = schedule.get(idx).cloned().flatten();
         let key_map = key_map.clone();
         handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.map_err(|e| anyhow!("semaphore: {e}"))?;
-            let _host_slot = host_slot(&url, opts.per_host_conns).await;
+            let _permit = until_cancel(shared.as_ref(), sem.acquire_owned())
+                .await?
+                .map_err(|e| anyhow!("semaphore: {e}"))?;
+            let _host_slot = until_cancel(shared.as_ref(), host_slot(&url, opts.per_host_conns)).await?;
             // Per-segment key from the schedule (P3 rotation): explicit IV
             // when the playlist gives one, else the sequence number.
             let kb: Option<[u8; 16]> = match &seg_key {
@@ -3618,7 +3770,7 @@ async fn download_hls(
                 // Bytes added below belong to THIS attempt; a mid-stream
                 // failure rolls them back so progress never overcounts.
                 let mut attempt_bytes: u64 = 0;
-                let got = opts.get(&client, &url).send().await;
+                let got = until_cancel(&shared, opts.get(&client, &url).send()).await?;
                 let data: Vec<u8> = match got {
                     Ok(resp) => {
                         let resp = match resp.error_for_status() {
@@ -3633,7 +3785,7 @@ async fn download_hls(
                                     abort.store(true, Ordering::SeqCst);
                                     return Err(m);
                                 }
-                                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                                sleep_live(&shared, 1 << attempt.min(4)).await?;
                                 continue;
                             }
                         };
@@ -3642,7 +3794,16 @@ async fn download_hls(
                         let mut buf = Vec::new();
                         let mut stream = resp.bytes_stream();
                         let mut bad: Option<anyhow::Error> = None;
-                        while let Some(chunk) = stream.next().await {
+                        loop {
+                            let chunk = match until_cancel(shared.as_ref(), stream.next()).await {
+                                Ok(Some(chunk)) => chunk,
+                                Ok(None) => break,
+                                Err(error) => {
+                                    sub_saturating(&shared.downloaded, attempt_bytes);
+                                    set_segment_progress(&shared, idx, 0, None);
+                                    return Err(error);
+                                }
+                            };
                             if abort.load(Ordering::SeqCst) {
                                 sub_saturating(&shared.downloaded, attempt_bytes);
                                 return Err(anyhow!("cancelled"));
@@ -3665,7 +3826,11 @@ async fn download_hls(
                                     attempt_bytes += bytes.len() as u64;
                                     shared.downloaded.fetch_add(bytes.len() as u64, Ordering::SeqCst);
                                     set_segment_progress(&shared, idx, attempt_bytes, None);
-                                    limiter.consume(bytes.len() as u64).await;
+                                    if let Err(error) = until_cancel(&shared, limiter.consume(bytes.len() as u64)).await {
+                                        sub_saturating(&shared.downloaded, attempt_bytes);
+                                        set_segment_progress(&shared, idx, 0, None);
+                                        return Err(error);
+                                    }
                                 }
                                 Err(e) => {
                                     bad = Some(anyhow!("segment network: {e}"));
@@ -3680,7 +3845,7 @@ async fn download_hls(
                                 abort.store(true, Ordering::SeqCst);
                                 return Err(e);
                             }
-                            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                            sleep_live(&shared, 1 << attempt.min(4)).await?;
                             continue;
                         }
                         // A clean-but-short socket close yields no error —
@@ -3695,7 +3860,7 @@ async fn download_hls(
                                         "segment short: got {} of {n} bytes", buf.len()
                                     ));
                                 }
-                                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                                sleep_live(&shared, 1 << attempt.min(4)).await?;
                                 continue;
                             }
                         }
@@ -3706,7 +3871,7 @@ async fn download_hls(
                             abort.store(true, Ordering::SeqCst);
                             return Err(anyhow!("segment fetch: {e}"));
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                        sleep_live(&shared, 1 << attempt.min(4)).await?;
                         continue;
                     }
                 };
@@ -3773,7 +3938,7 @@ async fn download_hls(
             out.write_all(init).await.map_err(|e| anyhow!(io_message(&e)))?;
             shared.downloaded.fetch_add(init.len() as u64, Ordering::SeqCst);
             shared.total.fetch_add(init.len() as u64, Ordering::SeqCst);
-            limiter.consume(init.len() as u64).await;
+            until_cancel(shared.as_ref(), limiter.consume(init.len() as u64)).await?;
         }
         for i in 0..segs.len() {
             let part = dest.with_extension(format!("hls{i}"));
@@ -3880,7 +4045,7 @@ async fn record_live_hls(
         // map change).
         if let Some(uri) = hls_map_init(&text, pl_url)? {
             if init_done.as_deref() != Some(uri.as_str()) {
-                let Some(blob) = fetch_live_segment(client, opts, &uri, opts.max_retries).await?
+                let Some(blob) = fetch_live_segment(client, opts, &uri, shared, opts.max_retries).await?
                 else {
                     return Err(anyhow!(
                         "the stream's init section (EXT-X-MAP) is gone from the server — cannot continue this fragmented-MP4 capture"
@@ -3891,7 +4056,7 @@ async fn record_live_hls(
                     .map_err(|e| anyhow!(io_message(&e)))?;
                 shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
                 written = written.saturating_add(blob.len() as u64);
-                limiter.consume(blob.len() as u64).await;
+                until_cancel(shared.as_ref(), limiter.consume(blob.len() as u64)).await?;
                 init_done = Some(uri);
             }
         }
@@ -3905,7 +4070,7 @@ async fn record_live_hls(
             }
             let slot = schedule.get(i).cloned().flatten();
             let kb = match &slot {
-                Some(k) => Some(hls_key_bytes(client, opts, &k.uri, &mut keys).await?),
+                Some(k) => Some(hls_key_bytes(client, opts, &k.uri, &mut keys, shared).await?),
                 None => None,
             };
             let iv = match (&kb, &slot) {
@@ -3915,7 +4080,7 @@ async fn record_live_hls(
                 },
                 _ => None,
             };
-            match fetch_live_segment(client, opts, seg_url, opts.max_retries).await? {
+            match fetch_live_segment(client, opts, seg_url, shared, opts.max_retries).await? {
                 Some(data) => {
                     let plain = match (&kb, iv) {
                         (Some(k), Some(v)) => aes128_cbc_decrypt(&data, k, &v)?,
@@ -3929,7 +4094,7 @@ async fn record_live_hls(
                     out.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
                     shared.downloaded.fetch_add(plain.len() as u64, Ordering::SeqCst);
                     written = written.saturating_add(plain.len() as u64);
-                    limiter.consume(plain.len() as u64).await;
+                    until_cancel(shared.as_ref(), limiter.consume(plain.len() as u64)).await?;
                 }
                 None => {
                     // The live window moved past this one; skip it instead of
@@ -3944,7 +4109,7 @@ async fn record_live_hls(
         }
         let wait = (hls_target_duration(&text) / 2).clamp(1, 5);
         sleep_live(shared, wait).await?;
-        match fetch_playlist_text(client, opts, pl_url).await {
+        match fetch_playlist_text(client, opts, pl_url, shared).await {
             Ok(t) => {
                 text = t;
                 refresh_fails = 0;
@@ -3988,15 +4153,13 @@ async fn fetch_playlist_text(
     client: &reqwest::Client,
     opts: &EngineOpts,
     url: &str,
+    shared: &Arc<SharedState>,
 ) -> Result<String> {
-    opts.get(client, url)
-        .send()
-        .await
+    let response = until_cancel(shared.as_ref(), opts.get(client, url).send()).await?
         .map_err(|e| anyhow!("playlist fetch: {e}"))?
         .error_for_status()
-        .map_err(|e| anyhow!("playlist HTTP: {e}"))?
-        .text()
-        .await
+        .map_err(|e| anyhow!("playlist HTTP: {e}"))?;
+    until_cancel(shared.as_ref(), response.text()).await?
         .map_err(|e| anyhow!("playlist read: {e}"))
 }
 
@@ -4006,19 +4169,16 @@ async fn hls_key_bytes(
     opts: &EngineOpts,
     uri: &str,
     cache: &mut std::collections::HashMap<String, [u8; 16]>,
+    shared: &Arc<SharedState>,
 ) -> Result<[u8; 16]> {
     if let Some(k) = cache.get(uri) {
         return Ok(*k);
     }
-    let kb = opts
-        .get(client, uri)
-        .send()
-        .await
+    let response = until_cancel(shared.as_ref(), opts.get(client, uri).send()).await?
         .map_err(|e| anyhow!("key fetch: {e}"))?
         .error_for_status()
-        .map_err(|e| anyhow!("key HTTP: {e}"))?
-        .bytes()
-        .await
+        .map_err(|e| anyhow!("key HTTP: {e}"))?;
+    let kb = until_cancel(shared.as_ref(), response.bytes()).await?
         .map_err(|e| anyhow!("key read: {e}"))?;
     if kb.len() != 16 {
         return Err(anyhow!("HLS key is not 16 bytes — refusing"));
@@ -4035,14 +4195,15 @@ async fn fetch_live_segment(
     client: &reqwest::Client,
     opts: &EngineOpts,
     url: &str,
+    shared: &Arc<SharedState>,
     max_retries: u32,
 ) -> Result<Option<Vec<u8>>> {
-    let _host_slot = host_slot(url, opts.per_host_conns).await;
+    let _host_slot = until_cancel(shared.as_ref(), host_slot(url, opts.per_host_conns)).await?;
     let max = max_retries.max(1);
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match opts.get(client, url).send().await {
+        match until_cancel(shared.as_ref(), opts.get(client, url).send()).await? {
             Ok(resp) => {
                 let status = resp.status();
                 if status == reqwest::StatusCode::NOT_FOUND
@@ -4053,14 +4214,11 @@ async fn fetch_live_segment(
                 match resp.error_for_status() {
                     Ok(r) => {
                         let expect = r.content_length();
-                        match r.bytes().await {
+                        match until_cancel(shared.as_ref(), r.bytes()).await? {
                             Ok(body) => {
                                 if let Some(n) = expect {
                                     if body.len() as u64 != n && attempt < max {
-                                        tokio::time::sleep(std::time::Duration::from_secs(
-                                            1 << attempt.min(3),
-                                        ))
-                                        .await;
+                                        sleep_live(shared, 1 << attempt.min(3)).await?;
                                         continue;
                                     }
                                 }
@@ -4087,12 +4245,12 @@ async fn fetch_live_segment(
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(3))).await;
+        sleep_live(shared, 1 << attempt.min(3)).await?;
     }
 }
 
 /// Sleep in short slices so Pause/Stop react immediately during a live wait.
-async fn sleep_live(shared: &Arc<SharedState>, secs: u64) -> Result<()> {
+pub(crate) async fn sleep_live(shared: &Arc<SharedState>, secs: u64) -> Result<()> {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(secs.max(1));
     loop {
         wait_if_paused(shared).await?;
@@ -4179,7 +4337,7 @@ async fn fallback_chain(
     if let Some(page) = yt_page {
         let client = opts.build_client()?;
         if !shared.ytdlp_tried.load(Ordering::SeqCst) {
-            if let Ok(exe) = ensure_ytdlp(&client).await {
+            if let Ok(exe) = until_cancel(shared.as_ref(), ensure_ytdlp(&client)).await? {
                 if dbg {
                     eprintln!("[dbg] native YouTube engine failed ({err:#}); continuing with yt-dlp");
                 }
@@ -4197,7 +4355,7 @@ async fn fallback_chain(
         let visitor = opts.browser.as_ref().map(|b| b.visitor_data.clone()).unwrap_or_default();
         let bot = format!("{err:#}").to_ascii_lowercase();
         if !visitor.is_empty() && opts.cookie.trim().is_empty() && (bot.contains("not a bot") || bot.contains("sign in to confirm")) {
-            if let Ok(exe) = ensure_ytdlp(&client).await {
+            if let Ok(exe) = until_cancel(shared.as_ref(), ensure_ytdlp(&client)).await? {
                 let mut o2 = opts.clone();
                 o2.ytdlp_visitor_data = visitor;
                 reset_counters(shared);
@@ -4219,8 +4377,8 @@ async fn fallback_chain(
         && url.starts_with("http")
     {
         let client = opts.build_client()?;
-        if bot_shielded(&client, opts, url).await {
-            if let Ok(exe) = ensure_ytdlp(&client).await {
+        if until_cancel(shared.as_ref(), bot_shielded(&client, opts, url)).await? {
+            if let Ok(exe) = until_cancel(shared.as_ref(), ensure_ytdlp(&client)).await? {
                 job_log(&opts.log_key, "refused by a bot shield (Cloudflare): retrying with a browser's TLS fingerprint");
                 shared.set_note("the site's bot shield refused the app - retried as a browser (TLS fingerprint)");
                 let mut o2 = opts.clone();
@@ -4251,7 +4409,9 @@ async fn fallback_chain(
     let low = format!("{err:#}").to_ascii_lowercase();
     if !opts.any_ip && shared.downloaded.load(Ordering::SeqCst) == 0 && unreachable_host(&low) {
         job_log(&opts.log_key, "could not reach the server: trying again (IPv6 allowed)");
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // Keep the retry pause responsive to Stop and Pause. A raw sleep here
+        // made an otherwise idle failed download hold shutdown for 3 seconds.
+        sleep_live(shared, 3).await?;
         let mut o2 = opts.clone();
         o2.any_ip = true;
         reset_counters(shared);
@@ -4405,7 +4565,7 @@ async fn download_inner(
     // Google Drive / Docs: the share link is a page; download what it serves.
     if crate::gdrive::is_drive_url(&url) {
         let client = opts.build_client()?;
-        url = crate::gdrive::resolve(&client, &opts, &url).await?;
+        url = crate::gdrive::resolve_for_download(&client, &opts, &url, shared.as_ref()).await?;
     }
     // Resolve Vimeo before probing the CDN: a successful fragment response
     // proves nothing about the full video's size or completeness.
@@ -4425,7 +4585,7 @@ async fn download_inner(
             }
         }
         let client = opts.build_client()?;
-        let exe = ensure_ytdlp(&client).await?;
+        let exe = until_cancel(shared.as_ref(), ensure_ytdlp(&client)).await??;
         shared.total.store(0, Ordering::SeqCst);
         shared.has_total.store(false, Ordering::SeqCst);
         shared.downloaded.store(0, Ordering::SeqCst);
@@ -4505,7 +4665,7 @@ async fn download_inner(
         None => opts.build_client()?,
     };
     if !opts.username.trim().is_empty() && mutex_guard(&opts.digest).is_none() {
-        learn_digest(&client, &opts, &url).await;
+        until_cancel(shared.as_ref(), learn_digest(&client, &opts, &url)).await?;
     }
 
     if let Some(parent) = dest.parent() {
@@ -4541,14 +4701,14 @@ async fn download_inner(
     let social = social_page_url(&url, &opts.referer);
     let mut range_verified: Option<Option<u64>> = None; // Some(x) = probe ran
     if direct_delivery && seeded_total.is_some() && social.is_none() {
-        match probe_range_once(&client, &opts, &url, seeded_total).await {
+        match until_cancel(shared.as_ref(), probe_range_once(&client, &opts, &url, seeded_total)).await? {
             Ok(verified) => range_verified = Some(verified),
             Err(e) => return Err(e), // expired/refused: fail fast, loudly
         }
     }
     let (mut total_opt, mut supports_range, ctype, disp) = match range_verified {
         Some(verified) => (verified.or(seeded_total), verified.is_some(), None, None),
-        None => probe(&client, &opts, &url).await,
+        None => probe_live(&client, &opts, &url, shared.as_ref()).await?,
     };
     // Some CDNs use opaque manifest URLs. Route by the actual response
     // type as well as extension, instead of saving playlist text as video.
@@ -4643,7 +4803,7 @@ async fn download_inner(
     // the progressive file. Anything it cannot do falls through to the
     // built-in engine below, progressive fallback and all.
     if is_yt && youtube_ytdlp_first(&opts) {
-        match ensure_ytdlp(&client).await {
+        match until_cancel(shared.as_ref(), ensure_ytdlp(&client)).await? {
             Ok(exe) => {
                 match download_with_ytdlp(&exe, &url, &dest, connections, &opts, &shared).await {
                     Ok(()) => return Ok(()),
@@ -4675,7 +4835,7 @@ async fn download_inner(
     // own (the progressive file), while here the captured asset is one leg of
     // an adaptive pair - there is no quality at which it contains sound.
     if let Some(page) = social {
-        match ensure_ytdlp(&client).await {
+        match until_cancel(shared.as_ref(), ensure_ytdlp(&client)).await? {
             Ok(exe) => {
                 // The helper reports the merged size itself; the browser's
                 // measurement describes one leg of the pair, not the result.
@@ -4705,7 +4865,7 @@ async fn download_inner(
     }
     if is_html || is_yt {
         let page_url = url.clone();
-        match resolve_media(&client, &opts, &url, &shared).await {
+        match until_cancel(shared.as_ref(), resolve_media(&client, &opts, &url, &shared)).await? {
             Some(hit) => {
                 url = hit.url;
                 // media servers expect the page as referer
@@ -4777,7 +4937,7 @@ async fn download_inner(
                                 // ffmpeg needed either).
                                 opts2.quality_pref = String::new();
                             }
-                            match resolve_media(&client, &opts2, &page_url, &shared).await {
+                            match until_cancel(shared.as_ref(), resolve_media(&client, &opts2, &page_url, &shared)).await? {
                                 Some(hit2) => {
                                     if sabr && opts2.allow_rename {
                                         note_youtube_downgrade(&hit2, &mut dest, &shared);
@@ -4805,7 +4965,7 @@ async fn download_inner(
                         }
                     }
                 }
-                let (t2, r2, ctype2, d2) = probe(&client, &opts, &url).await;
+                let (t2, r2, ctype2, d2) = probe_live(&client, &opts, &url, shared.as_ref()).await?;
                 total_opt = t2;
                 supports_range = r2;
                 shared.resumable.store(r2, Ordering::SeqCst);
@@ -4942,7 +5102,7 @@ async fn download_inner(
                     && is_youtube_page(&opts.referer) =>
             {
                 retried_fresh = true;
-                match resolve_media(&client, &opts, &opts.referer, &shared).await {
+                match until_cancel(shared.as_ref(), resolve_media(&client, &opts, &opts.referer, &shared)).await? {
                     Some(hit) if hit.url != url && is_googlevideo_url(&hit.url) => {
                         // Drop partials of the refused stream: resuming them
                         // against a different URL would corrupt the file.
@@ -4959,7 +5119,7 @@ async fn download_inner(
                         }
                         shared.downloaded.store(0, Ordering::SeqCst);
                         url = hit.url;
-                        let (t3, r3, _, _) = probe(&client, &opts, &url).await;
+                        let (t3, r3, _, _) = probe_live(&client, &opts, &url, shared.as_ref()).await?;
                         total_opt = t3;
                         supports_range = r3;
                         shared.resumable.store(r3, Ordering::SeqCst);
@@ -5238,9 +5398,10 @@ pub async fn ffmpeg_mux(
     video: &std::path::Path,
     audio: Option<&std::path::Path>,
     dest: &PathBuf,
+    shared: &Arc<SharedState>,
 ) -> Result<()> {
-    let ff = ensure_ffmpeg(&reqwest::Client::new())
-        .await
+    let ff = until_cancel(shared.as_ref(), ensure_ffmpeg(&reqwest::Client::new()))
+        .await?
         .map_err(|e| anyhow!("cannot merge video + audio: {e:#}"))?;
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -5263,7 +5424,11 @@ pub async fn ffmpeg_mux(
         cmd.args(["-movflags", "+faststart"]);
     }
     cmd.arg(dest);
-    let out = cmd.output().await.map_err(|e| anyhow!("ffmpeg launch: {e}"))?;
+    // Dropping the output future drops the child; kill_on_drop then terminates
+    // ffmpeg promptly when the user stops the download or the app shuts down.
+    let out = until_cancel(shared.as_ref(), cmd.output())
+        .await?
+        .map_err(|e| anyhow!("ffmpeg launch: {e}"))?;
     if !out.status.success() {
         let tail = String::from_utf8_lossy(&out.stderr);
         let tail: String = tail.chars().rev().take(400).collect::<String>().chars().rev().collect();
@@ -5392,38 +5557,43 @@ fn ytdlp_custom_path() -> Option<std::path::PathBuf> {
     crate::platform::executable_file(&p).then_some(p)
 }
 
-/// The JS runtime yt-dlp needs to solve YouTube's player challenges. Only
-/// deno is enabled by default, while node is far more commonly installed —
-/// without one, extraction fails outright on many videos with yt-dlp's
-/// "The page needs to be reloaded" (verified live here: same URL and cookies,
-/// same release, works with `--js-runtimes node` and fails without it).
+/// The app-managed Deno, or a supported Deno installation on PATH, is the
+/// only JavaScript runtime the desktop app invokes for yt-dlp. The desktop
+/// process never searches for or launches Node.js.
 fn js_runtime_path() -> Option<(&'static str, std::path::PathBuf)> {
     // The app's own Deno (Settings → Plugins → Install) comes first.
     if let Some(p) = deno_local_path().filter(|p| crate::platform::executable_file(p)) {
         return Some(("deno", p));
     }
-    for name in ["deno", "node"] {
-        let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
-        for dir in tool_dirs() {
-            let path=dir.join(&file);
-            if crate::platform::executable_file(&path) {
-                let mut command=std::process::Command::new(&path);command.arg("--version");
-                let valid=crate::platform::version_output(command).map(|out|runtime_version_supported(name,&String::from_utf8_lossy(&out.stdout))).unwrap_or(false);
-                if valid {return Some((name,path));}
+    let file = if cfg!(windows) { "deno.exe" } else { "deno" };
+    for dir in tool_dirs() {
+        let path = dir.join(file);
+        if crate::platform::executable_file(&path) {
+            let mut command = crate::platform::silent_command(&path);
+            command.arg("--version");
+            let valid = crate::platform::version_output(command)
+                .map(|out| deno_version_supported(&String::from_utf8_lossy(&out.stdout)))
+                .unwrap_or(false);
+            if valid {
+                return Some(("deno", path));
             }
         }
     }
     None
 }
-fn runtime_version_supported(name:&str,version:&str)->bool {
-    let word=version.split_whitespace().find(|w|w.chars().next().map(|c|c.is_ascii_digit()||c=='v').unwrap_or(false)).unwrap_or("");
-    let parts:Vec<u32>=word.trim_start_matches('v').split('.').map(|s|s.parse().unwrap_or(0)).collect();
-    let major=parts.first().copied().unwrap_or(0);let minor=parts.get(1).copied().unwrap_or(0);
-    match name {"node"=>major>=22,"deno"=>major>2||(major==2&&minor>=3),_=>false}
+fn deno_version_supported(version: &str) -> bool {
+    let word = version
+        .split_whitespace()
+        .find(|word| word.chars().next().is_some_and(|ch| ch.is_ascii_digit() || ch == 'v'))
+        .unwrap_or("");
+    let mut parts = word.trim_start_matches('v').split('.');
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    major > 2 || (major == 2 && minor >= 3)
 }
 fn js_runtime() -> Option<&'static str> { js_runtime_path().map(|(name,_)| name) }
 
-/// The JavaScript runtime yt-dlp will use ("deno", "node"…), if any.
+/// The Deno runtime yt-dlp will be told about, if one is available.
 pub fn js_runtime_name() -> Option<&'static str> { js_runtime() }
 
 /// yt-dlp, ffmpeg and a JavaScript runtime are all there (file checks only,
@@ -5552,10 +5722,10 @@ pub fn deno_install_blocking() -> Result<std::path::PathBuf> {
     }
     std::fs::rename(&tmp, &dst)?;
     // Must answer like a supported Deno, or it is not kept.
-    let mut cmd = std::process::Command::new(&dst);
+    let mut cmd = crate::platform::silent_command(&dst);
     cmd.arg("--version");
     let ok = crate::platform::first_run_output(cmd)
-        .map(|o| runtime_version_supported("deno", &String::from_utf8_lossy(&o.stdout)))
+        .map(|o| deno_version_supported(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or(false);
     if !ok {
         let _ = std::fs::remove_file(&dst);
@@ -5776,7 +5946,7 @@ async fn fetch_ytdlp(client: &reqwest::Client, dst: &std::path::Path) -> Result<
 /// `--version` of a copy that was just downloaded, with the long first-run
 /// allowance (`platform::first_run_output`).
 fn ytdlp_first_version(exe: &std::path::Path) -> Option<String> {
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = crate::platform::silent_command(exe);
     cmd.arg("--version");
     let out = crate::platform::first_run_output(cmd)?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -5843,13 +6013,7 @@ pub fn ytdlp_bin_dir() -> Option<std::path::PathBuf> {
 /// Ask the helper for its version. This *runs* it (about a second for the
 /// frozen build), so never call it from a UI thread.
 fn ytdlp_version(exe: &std::path::Path) -> Option<String> {
-    let mut cmd = std::process::Command::new(exe);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    let mut cmd = crate::platform::silent_command(exe);
     cmd.arg("--version");
     let out = crate::platform::version_output(cmd)?;
     if !out.status.success() {
@@ -5925,13 +6089,7 @@ pub fn ffmpeg_info() -> FfmpegInfo {
 /// `ffmpeg -version` opens with "ffmpeg version 7.1-full_build-www.gyan.dev
 /// Copyright (c) …": the release build around the word "version".
 fn ffmpeg_version(exe: &std::path::Path) -> Option<String> {
-    let mut cmd = std::process::Command::new(exe);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    let mut cmd = crate::platform::silent_command(exe);
     cmd.arg("-version");
     let out = crate::platform::version_output(cmd)?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -6866,7 +7024,7 @@ async fn download_with_ytdlp(
     if merge_ffmpeg.is_none() {
         if let Ok(c) = opts.build_client() {
             shared.set_phase("Fetching ffmpeg");
-            match ensure_ffmpeg(&c).await {
+            match until_cancel(shared.as_ref(), ensure_ffmpeg(&c)).await? {
                 Ok(p) => merge_ffmpeg = Some(p),
                 Err(e) => shared.set_note(format!(
                     "ffmpeg is unavailable ({e:#}) — downloading the best single-file quality instead"
@@ -7073,16 +7231,12 @@ async fn download_with_ytdlp(
         }
         kept.into_iter().collect::<Vec<_>>().join(" | ")
     });
-    let finish = loop {
-        if shared.cancelled.load(Ordering::SeqCst) {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            break Err(anyhow!("cancelled"));
-        }
-        match tokio::time::timeout(std::time::Duration::from_millis(200), child.wait()).await {
-            Ok(Ok(status)) => break Ok(status),
-            Ok(Err(e)) => break Err(anyhow!("yt-dlp wait: {e}")),
-            Err(_) => continue,
+    let finish = tokio::select! {
+        result = child.wait() => result.map_err(|e| anyhow!("yt-dlp wait: {e}")),
+        _ = shared.cancelled() => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(200), child.wait()).await;
+            Err(anyhow!("cancelled"))
         }
     };
     drop(process_tree);
@@ -7259,7 +7413,7 @@ async fn download_adaptive_inner(
         && ffmpeg_path().is_none()
     {
         shared.set_phase("Fetching ffmpeg");
-        ensure_ffmpeg(&client).await.map_err(|e| {
+        until_cancel(shared.as_ref(), ensure_ffmpeg(&client)).await?.map_err(|e| {
             anyhow!(
                 "this quality needs merging (video-only + audio), and {e:#}; 720p and below download as single files without it"
             )
@@ -7269,7 +7423,7 @@ async fn download_adaptive_inner(
         tokio::fs::create_dir_all(parent).await?;
     }
     // Probe both legs (referer/cookies apply — media servers expect them).
-    let (v_total, v_range, vtype, v_disp) = probe(&client, &opts, &video_url).await;
+    let (v_total, v_range, vtype, v_disp) = probe_live(&client, &opts, &video_url, shared.as_ref()).await?;
     shared.resumable.store(v_range, Ordering::SeqCst);
     if opts.allow_rename {
         if let Some(n) = v_disp {
@@ -7279,7 +7433,7 @@ async fn download_adaptive_inner(
     }
     let (a_total, a_range, atype, _) = match &audio_url {
         Some(a) => {
-            let (t, r, c, _) = probe(&client, &opts, a).await;
+            let (t, r, c, _) = probe_live(&client, &opts, a, shared.as_ref()).await?;
             (t, r, c, ())
         }
         None => (None, false, None, ()),
@@ -7346,8 +7500,8 @@ async fn download_adaptive_inner(
     struct CancelLegs(Arc<SharedState>, Arc<SharedState>);
     impl Drop for CancelLegs {
         fn drop(&mut self) {
-            self.0.cancelled.store(true, Ordering::SeqCst);
-            self.1.cancelled.store(true, Ordering::SeqCst);
+            self.0.cancel();
+            self.1.cancel();
         }
     }
     let _cancel_legs = CancelLegs(sv.clone(), sa.clone());
@@ -7396,7 +7550,7 @@ async fn download_adaptive_inner(
             for leg in [&sv, &sa] {
                 leg.paused.store(paused, Ordering::SeqCst);
                 if cancelled {
-                    leg.cancelled.store(true, Ordering::SeqCst);
+                    leg.cancel();
                 }
             }
             let sum = sv.downloaded.load(Ordering::SeqCst)
@@ -7430,7 +7584,7 @@ async fn download_adaptive_inner(
     // Mux (or plain move when audio-less). The unique work dir is removed on
     // every exit so failed merges never poison the next attempt.
     let finish: Result<()> = if has_audio {
-        ffmpeg_mux(&v_dest, Some(&a_dest), &dest).await
+        ffmpeg_mux(&v_dest, Some(&a_dest), &dest, &shared).await
     } else {
         tokio::fs::rename(&v_dest, &dest)
             .await
@@ -7915,7 +8069,7 @@ async fn dash_fetch_blob(
     shared: &Arc<SharedState>,
     max_retries: u32,
 ) -> Result<Vec<u8>> {
-    let _host_slot = host_slot(&url, opts.per_host_conns).await;
+    let _host_slot = until_cancel(shared.as_ref(), host_slot(&url, opts.per_host_conns)).await?;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -7923,11 +8077,12 @@ async fn dash_fetch_blob(
         if shared.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("cancelled"));
         }
-        match opts.get(client, &url).send().await {
+        match until_cancel(shared.as_ref(), opts.get(client, &url).send()).await? {
             Ok(resp) => match resp.error_for_status() {
                 Ok(r) => {
                     let expect = r.content_length();
-                    let body = r.bytes().await.map_err(|e| anyhow!("segment network: {e}"))?;
+                    let body = until_cancel(shared.as_ref(), r.bytes()).await?
+                        .map_err(|e| anyhow!("segment network: {e}"))?;
                     // Same clean-but-short guard as HLS segments.
                     if let Some(n) = expect {
                         if body.len() as u64 != n {
@@ -7936,7 +8091,7 @@ async fn dash_fetch_blob(
                                     "segment short: got {} of {n} bytes", body.len()
                                 ));
                             }
-                            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+                            sleep_live(shared, 1 << attempt.min(4)).await?;
                             continue;
                         }
                     }
@@ -7955,7 +8110,7 @@ async fn dash_fetch_blob(
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+        sleep_live(shared, 1 << attempt.min(4)).await?;
     }
 }
 
@@ -8000,7 +8155,7 @@ async fn dash_rep_download(
             let blob = dash_fetch_blob(client, opts, u, shared, max_retries).await?;
             out.write_all(&blob).await.map_err(|e| anyhow!(io_message(&e)))?;
             shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
-            limiter.consume(blob.len() as u64).await;
+            until_cancel(shared.as_ref(), limiter.consume(blob.len() as u64)).await?;
         }
     }
     if let Some(media_tpl) = rep.seg_media.clone() {
@@ -8024,14 +8179,16 @@ async fn dash_rep_download(
             let limiter = limiter.clone();
             let sem = sem.clone();
             handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.map_err(|e| anyhow!("semaphore: {e}"))?;
+                let _permit = until_cancel(shared.as_ref(), sem.acquire_owned())
+                    .await?
+                    .map_err(|e| anyhow!("semaphore: {e}"))?;
                 if shared.cancelled.load(Ordering::SeqCst) {
                     return Err(anyhow!("cancelled"));
                 }
                 let blob = dash_fetch_blob(&client, &opts, u, &shared, max_retries).await?;
                 tokio::fs::write(&part, &blob).await.map_err(|e| anyhow!(io_message(&e)))?;
                 shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
-                limiter.consume(blob.len() as u64).await;
+                until_cancel(shared.as_ref(), limiter.consume(blob.len() as u64)).await?;
                 Ok::<(), anyhow::Error>(())
             }));
         }
@@ -8071,7 +8228,7 @@ async fn dash_rep_download(
         let blob = dash_fetch_blob(client, opts, u, shared, max_retries).await?;
         out.write_all(&blob).await.map_err(|e| anyhow!(io_message(&e)))?;
         shared.downloaded.fetch_add(blob.len() as u64, Ordering::SeqCst);
-        limiter.consume(blob.len() as u64).await;
+        until_cancel(shared.as_ref(), limiter.consume(blob.len() as u64)).await?;
     } else {
         return Err(anyhow!("DASH representation has neither BaseURL nor SegmentTemplate"));
     }
@@ -8139,7 +8296,7 @@ pub async fn download_dash(
     // spending the bandwidth (the app's own copy is fetched on demand).
     if a.is_some() && ffmpeg_path().is_none() {
         shared.set_phase("Fetching ffmpeg");
-        ensure_ffmpeg(&client).await.map_err(|e| {
+        until_cancel(shared.as_ref(), ensure_ffmpeg(&client)).await?.map_err(|e| {
             anyhow!("this DASH stream has separate video + audio, and {e:#}")
         })?;
     }
@@ -8194,7 +8351,7 @@ pub async fn download_dash(
                 .or_else(|| rep.seg_dur_secs.and_then(|d| dash_seg_count(mpd_dur, d)));
             let rep_id_a = if rep.id.is_empty() { rep.bandwidth.to_string() } else { rep.id.clone() };
             dash_rep_download(&client, &opts, manifest_url, &rep, &rep_id_a, count_a, &a_dest, &shared, &limiter, parallel).await?;
-            ffmpeg_mux(&v_dest, Some(&a_dest), &dest).await
+            ffmpeg_mux(&v_dest, Some(&a_dest), &dest, &shared).await
         } else {
             // Video-only manifest: deliver the assembled track as-is.
             tokio::fs::rename(&v_dest, &dest)
@@ -8355,7 +8512,7 @@ async fn single_stream(
                     if stalled >= max_retries || attempt >= max_retries * 20 {
                         return Err(e);
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+                    sleep_live(&shared, 1 << stalled.min(4)).await?;
                     continue;
                 }
                 let msg = e.to_string();
@@ -8397,7 +8554,7 @@ async fn single_stream(
                 if stalled >= max_retries || attempt >= max_retries * 20 {
                     return Err(with_attempt_summary(e, attempt, cuts, stalls, restarts));
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+                sleep_live(&shared, 1 << stalled.min(4)).await?;
             }
         }
     }
@@ -8441,14 +8598,14 @@ async fn single_stream_once(
     } else {
         req.header(reqwest::header::RANGE, format!("bytes={start_at}-"))
     };
-    let resp = match req.send().await?.error_for_status() {
+    let response = until_cancel(shared.as_ref(), req.send()).await?.error_for_status();
+    let resp = match response {
         Ok(r) => r,
         Err(e) => {
             let mapped = http_status_err(url, e);
             if start_at == 0 && !is_final_http_error(&mapped) {
                 // server dislikes Range (but isn't refusing us): plain GET
-                opts.get(client, url)
-                    .send()
+                until_cancel(shared.as_ref(), opts.get(client, url).send())
                     .await?
                     .error_for_status()
                     .map_err(|e| http_status_err(url, e))?
@@ -8535,14 +8692,18 @@ async fn single_stream_once(
     // progress by the file's length, so buffered bytes must not be lost.
     let mut failure: Option<anyhow::Error> = None;
     loop {
-        let next = match tokio::time::timeout(
-            std::time::Duration::from_secs(stall_timeout),
-            stream.next(),
+        let next = match until_cancel(
+            shared.as_ref(),
+            tokio::time::timeout(std::time::Duration::from_secs(stall_timeout), stream.next()),
         )
         .await
         {
-            Ok(n) => n,
-            Err(_) => {
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => {
                 failure = Some(anyhow!(
                     "stalled (no data for {stall_timeout}s) — resuming"
                 ));
@@ -8570,7 +8731,10 @@ async fn single_stream_once(
                 *slot = slot.saturating_add(bytes.len() as u64);
             }
         }
-        limiter.consume(bytes.len() as u64).await;
+        if let Err(error) = until_cancel(shared.as_ref(), limiter.consume(bytes.len() as u64)).await {
+            failure = Some(error);
+            break;
+        }
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
@@ -8597,7 +8761,7 @@ async fn single_stream_once(
         // of finalizing a truncated file as "Completed".
     } else {
         let got = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
-        let (t, _, _, _) = probe(client, opts, url).await;
+        let (t, _, _, _) = probe_live(client, opts, url, shared.as_ref()).await?;
         if let Some(total) = t {
             shared.total.store(total, Ordering::SeqCst);
             shared.has_total.store(true, Ordering::SeqCst);
@@ -8714,7 +8878,7 @@ async fn chunked_stream(
                         if refusals < 2 {
                             refusals += 1;
                             let wait = (2u64 << refusals.min(4)).min(30);
-                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                            sleep_live(&shared, wait).await?;
                             continue;
                         }
                         // SABR-gated streams (`gir=yes`) expose only their
@@ -8742,7 +8906,7 @@ async fn chunked_stream(
                     if stalled >= max_retries || attempt >= max_retries * 30 {
                         return Err(e);
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+                    sleep_live(&shared, 1 << stalled.min(4)).await?;
                     continue;
                 }
                 let msg = e.to_string();
@@ -8763,7 +8927,7 @@ async fn chunked_stream(
                             *slot = 0;
                         }
                     }
-                    if let (t, _, _, _) = probe(client, opts, url).await {
+                    if let (t, _, _, _) = probe_live(client, opts, url, shared.as_ref()).await? {
                         if let Some(t) = t {
                             total = t;
                             shared.total.store(t, Ordering::SeqCst);
@@ -8787,7 +8951,7 @@ async fn chunked_stream(
                 if stalled >= max_retries || attempt >= max_retries * 30 {
                     return Err(with_attempt_summary(e, attempt, cuts, stalls, restarts));
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+                sleep_live(&shared, 1 << stalled.min(4)).await?;
             }
         }
     }
@@ -8921,7 +9085,7 @@ async fn chunked_once(
                 *slot = slot.saturating_add(data.len() as u64);
             }
         }
-        limiter.consume(data.len() as u64).await;
+        until_cancel(shared.as_ref(), limiter.consume(data.len() as u64)).await?;
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
@@ -9078,11 +9242,17 @@ async fn run_dce(
         let (progress, control, shared, done) = (progress.clone(), control.clone(), shared.clone(), done.clone());
         tokio::spawn(async move {
             loop {
-                sync_engine_progress(&progress, &control, &shared, total);
+                tokio::select! {
+                    _ = shared.cancelled() => {
+                        control.cancel();
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
                 if done.load(Ordering::SeqCst) {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                sync_engine_progress(&progress, &control, &shared, total);
             }
         })
     };
@@ -11367,12 +11537,11 @@ mod tests {
 mod platform_helper_tests {
     use super::*;
     #[test]
-    fn supported_runtime_versions_are_not_just_executable_names(){
-        assert!(runtime_version_supported("node","v22.0.0"));
-        assert!(!runtime_version_supported("node","v18.20.0"));
-        assert!(runtime_version_supported("deno","deno 2.3.0"));
-        assert!(!runtime_version_supported("deno","deno 2.2.9"));
-        assert!(!runtime_version_supported("node","unrecognized"));
+    fn supported_deno_versions_are_not_just_executable_names(){
+        assert!(deno_version_supported("deno 2.3.0"));
+        assert!(deno_version_supported("deno 3.0.0"));
+        assert!(!deno_version_supported("deno 2.2.9"));
+        assert!(!deno_version_supported("unrecognized"));
     }
     #[test]
     fn helper_status_and_download_selection_use_the_same_precedence(){

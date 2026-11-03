@@ -1,7 +1,20 @@
 //! OS-specific integration. Windows keeps its existing implementation;
 //! these functions provide the native equivalents on macOS and Linux.
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Construct a child process without opening a console window on Windows.
+/// Use this for helpers and OS integration commands launched by the GUI.
+pub fn silent_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command
+}
 
 /// AppImage mount paths disappear after exit. Relaunch the permanent image.
 pub fn launch_path() -> std::io::Result<PathBuf> {
@@ -94,17 +107,17 @@ pub fn open_url(url: &str) {
         return;
     }
     #[cfg(windows)]
-    let _ = Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]).spawn();
+    let _ = silent_command("rundll32.exe").args(["url.dll,FileProtocolHandler", url]).spawn();
     #[cfg(target_os = "macos")]
-    let _ = Command::new("open").arg(url).spawn();
+    let _ = silent_command("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
-    let _ = Command::new("xdg-open").arg(url).spawn();
+    let _ = silent_command("xdg-open").arg(url).spawn();
 }
 
 pub fn open(path: &Path, reveal: bool) {
     #[cfg(target_os = "macos")]
     {
-        let mut c = Command::new("open");
+        let mut c = silent_command("open");
         if reveal && !path.is_dir() {
             c.arg("-R");
         }
@@ -118,7 +131,7 @@ pub fn open(path: &Path, reveal: bool) {
         } else {
             path
         };
-        let _ = Command::new("xdg-open").arg(target).spawn();
+        let _ = silent_command("xdg-open").arg(target).spawn();
     }
     #[cfg(windows)]
     {
@@ -138,12 +151,12 @@ pub fn play_sound(ok: bool) {
     #[cfg(target_os = "macos")]
     {
         let f = if ok { "/System/Library/Sounds/Glass.aiff" } else { "/System/Library/Sounds/Basso.aiff" };
-        let _ = std::process::Command::new("afplay").arg(f).spawn();
+        let _ = silent_command("afplay").arg(f).spawn();
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let id = if ok { "complete" } else { "dialog-error" };
-        let _ = std::process::Command::new("canberra-gtk-play").args(["-i", id]).spawn();
+        let _ = silent_command("canberra-gtk-play").args(["-i", id]).spawn();
     }
 }
 
@@ -180,12 +193,12 @@ pub fn play_sound_file(event: &str, file: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("afplay").arg(file).spawn();
+        let _ = silent_command("afplay").arg(file).spawn();
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if Command::new("paplay").arg(file).spawn().is_err() {
-            let _ = Command::new("aplay").arg("-q").arg(file).spawn();
+        if silent_command("paplay").arg(file).spawn().is_err() {
+            let _ = silent_command("aplay").arg("-q").arg(file).spawn();
         }
     }
 }
@@ -193,7 +206,7 @@ pub fn play_sound_file(event: &str, file: &str) {
 pub fn power(action: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut command = {
-        let mut c = Command::new(if action == "sleep" {
+        let mut c = silent_command(if action == "sleep" {
             "pmset"
         } else {
             "osascript"
@@ -209,7 +222,7 @@ pub fn power(action: &str) -> Result<(), String> {
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut command = {
-        let mut c = Command::new("systemctl");
+        let mut c = silent_command("systemctl");
         c.arg(match action {
             "shutdown" => "poweroff",
             "sleep" => "suspend",
@@ -319,7 +332,7 @@ pub fn install_native_host(browser: &str) -> Result<String, String> {
         manifest["allowed_extensions"] = serde_json::json!(["send-to-download-craft@example"]);
     } else {
         manifest["allowed_origins"] =
-            serde_json::json!([format!("chrome-extension://{}/", crate::app::EXTENSION_ID)]);
+            serde_json::json!([format!("chrome-extension://{}/", crate::integration::EXTENSION_ID)]);
     }
     let path = dir.join("com.download_craft.json");
     std::fs::write(
@@ -437,7 +450,7 @@ mod audit_tests {
     use super::*;
     #[test]
     fn audit_version_probe_drains_large_output() {
-        let mut c = Command::new("python3");
+        let mut c = silent_command("python3");
         c.args(["-c", "import sys;sys.stdout.write('v' * 262144)"]);
         let out = version_output(c).expect("a noisy working tool must not deadlock");
         assert!(out.status.success());
@@ -454,7 +467,7 @@ pub fn antivirus_command(template: &str, path: &Path) -> Result<Command,String> 
     let args=windows_command_args(template)?;
     let (program,args)=args.split_first().ok_or("Antivirus command is empty")?;
     if program.is_empty() {return Err("Antivirus executable is empty".into());}
-    let mut cmd=Command::new(program);
+    let mut cmd=silent_command(program);
     for arg in args { cmd.arg(arg.replace("{file}",&path.to_string_lossy())); }
     #[cfg(windows)]
     {use std::os::windows::process::CommandExt;cmd.creation_flags(0x08000000);}

@@ -2,7 +2,7 @@
 //!
 //! Next to the download's data file (`<file>.dcdata`) the engine keeps a small
 //! journal (`<file>.dcjournal`) listing the byte ranges that are still
-//! missing. It is rewritten atomically every few seconds and on pause or
+//! missing. It is rewritten atomically at most once per second and on pause or
 //! failure, after the data written so far has been flushed to disk, so a
 //! crash or power cut loses at most the last few seconds.
 
@@ -44,9 +44,65 @@ impl Journal {
     /// mid-write never leaves a half journal behind.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = with_suffix(path, ".tmp");
-        std::fs::write(&tmp, serde_json::to_vec(self).map_err(std::io::Error::other)?)?;
-        std::fs::rename(&tmp, path)
+        let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&tmp, path)?;
+        sync_parent(path)
     }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(not(windows))]
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn sync_parent(_: &Path) -> std::io::Result<()> {
+    // MoveFileExW above requests MOVEFILE_WRITE_THROUGH on Windows.
+    Ok(())
 }
 
 pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -67,6 +123,9 @@ mod tests {
         let j = Journal::new("https://x/a.bin", 100, Some("\"e\"".into()), None, vec![(10, 20), (50, 100)]);
         j.save(&p).unwrap();
         assert_eq!(Journal::load(&p), Some(j));
+        let updated = Journal::new("https://x/a.bin", 100, Some("\"e\"".into()), None, vec![(50, 100)]);
+        updated.save(&p).unwrap();
+        assert_eq!(Journal::load(&p), Some(updated));
         std::fs::write(&p, b"{not json").unwrap();
         assert_eq!(Journal::load(&p), None);
         let _ = std::fs::remove_dir_all(dir);

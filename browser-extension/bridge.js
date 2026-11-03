@@ -23,6 +23,9 @@ var DCBridge = (() => {
   let rid = 0;
   let backoff = 1000;
   let retryTimer = 0;
+  let captureSequence = 0;
+  const captureIds = new WeakMap();
+  const requestIds = new WeakMap();
   const waiters = new Map(); // rid -> {resolve, reject, timer}
   const handlers = { settings: [], event: [], pageFetch: [], state: [] };
 
@@ -32,15 +35,18 @@ var DCBridge = (() => {
     }
   }
 
-  function connect() {
+  async function connect() {
     retryTimer = 0;
     if (port || !host) return;
-    try {
-      port = api.runtime.connectNative(host);
-    } catch (e) {
-      port = null;
-      return later();
+    const delays = [150, 300];
+    for (let attempt = 0; attempt < 3 && !port; attempt++) {
+      try {
+        port = api.runtime.connectNative(host);
+      } catch (e) {
+        if (attempt < delays.length) await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      }
     }
+    if (!port) return later();
     port.onMessage.addListener(onMessage);
     port.onDisconnect.addListener(() => {
       void (chrome.runtime && chrome.runtime.lastError);
@@ -86,13 +92,58 @@ var DCBridge = (() => {
     });
   }
 
+  function outgoingMessage(msg) {
+    if (!msg || typeof msg !== "object") return msg;
+    const validId = (id) => typeof id === "string" && /^[A-Za-z0-9._-]{8,96}$/.test(id);
+    const makeId = () => typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${(++captureSequence).toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    if (msg.type === "download" && !validId(msg.captureId)) {
+      let id = captureIds.get(msg);
+      if (!id) {
+        id = makeId();
+        captureIds.set(msg, id);
+      }
+      return { ...msg, captureId: id };
+    }
+    // These messages append commands, download history, or open a batch
+    // window. A timeout can trigger a one-shot retry after the first host
+    // already acted, so keep a stable id across that retry as well.
+    if (["links", "control", "record"].includes(msg.type) && !validId(msg.requestId)) {
+      let id = requestIds.get(msg);
+      if (!id) {
+        id = makeId();
+        requestIds.set(msg, id);
+      }
+      return { ...msg, requestId: id };
+    }
+    return msg;
+  }
+
+  async function sendOneShot(msg) {
+    const delays = [150, 300];
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const reply = await api.runtime.sendNativeMessage(host || "com.download_craft", msg);
+        if (reply) return reply;
+        lastError = new Error("the native host returned no reply");
+      } catch (error) {
+        lastError = error;
+      }
+      if (attempt < delays.length) await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+    }
+    throw lastError || new Error("the native host did not respond");
+  }
+
   // Every message to the app goes through here: the live port when there is
   // one, the one-shot host otherwise (same replies either way).
   async function send(msg) {
+    const outgoing = outgoingMessage(msg);
     if (live && port) {
-      try { return await call(msg); } catch (e) { /* fall back below */ }
+      try { return await call(outgoing); } catch (e) { /* fall back below */ }
     }
-    return api.runtime.sendNativeMessage(host || "com.download_craft", msg);
+    return sendOneShot(outgoing);
   }
 
   // ---- the browser's side of each request -----------------------------------

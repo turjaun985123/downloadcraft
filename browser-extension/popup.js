@@ -119,9 +119,18 @@ chrome.runtime.sendMessage({ type: "getState" }, (res) => {
     return;
   }
   hostOk = !!res.hostOk;
-  $("conn").textContent = res.hostOk ? "● App connected" : "● Browser only";
-  $("conn").className = res.hostOk ? "conn ok" : "conn bad";
-  $("conn").title = res.hostOk ? "Download Craft is ready" : (res.hostError || "Download Craft is not running — videos can still be downloaded in the browser.");
+  const appState = res.appState || (hostOk ? "not_running" : "host_unavailable");
+  const states = {
+    running: ["● App running", "conn ok", "Download Craft and the browser integration are connected."],
+    starting: ["● App starting", "conn warn", "The browser integration is ready; Download Craft is starting."],
+    closing: ["● App closing", "conn warn", "Download Craft is shutting down. Try again in a moment."],
+    not_running: ["● App not running", "conn warn", "The browser integration is available. Download will start Download Craft."],
+    host_unavailable: ["● Integration unavailable", "conn bad", res.hostError || "The native messaging host is unavailable."],
+  };
+  const state = states[hostOk ? appState : "host_unavailable"] || states.not_running;
+  $("conn").textContent = state[0];
+  $("conn").className = state[1];
+  $("conn").title = state[2];
   $("auto").checked = !!res.autoCapture;
   $("detect").checked = res.detection !== false;
   $("deep").checked = res.deepDetect !== false;

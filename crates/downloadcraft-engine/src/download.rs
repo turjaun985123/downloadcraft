@@ -119,6 +119,7 @@ struct Meta {
 /// How one attempt on a segment ended badly.
 enum Fail {
     Cancelled,
+    Paused,
     Fatal(Error),
     Retry { msg: String, progressed: bool },
     Throttled { status: u16, retry_after: Option<Duration> },
@@ -158,6 +159,10 @@ struct Run {
     refreshed: AtomicBool,
     refresh_lock: tokio::sync::Mutex<()>,
     dirty: AtomicBool,
+    /// A worker reached a pause, terminal segment boundary, or failure.
+    /// The monitor remains the only journal writer and services this at its
+    /// next tick, independent of the periodic one-second checkpoint.
+    journal_now: AtomicBool,
     resumed: u64,
     dest_is_html: bool,
 }
@@ -179,6 +184,9 @@ impl Run {
             *g = Some(e);
         }
         self.stop.store(true, Ordering::SeqCst);
+        // Wake requests, response streams, pauses and retry sleeps so the
+        // other workers can flush their current buffers and stop promptly.
+        self.control.cancel();
     }
 
     /// Leave when more connections run than allowed (the live count drops
@@ -220,8 +228,12 @@ impl Run {
     /// Sleep, waking early when the download stops.
     async fn nap(&self, d: Duration) {
         let until = Instant::now() + d;
-        while Instant::now() < until && !self.stopping() {
-            tokio::time::sleep(Duration::from_millis(150).min(until - Instant::now())).await;
+        while Instant::now() < until && !self.stopping() && !self.control.is_paused() {
+            tokio::select! {
+                _ = self.control.cancelled() => return,
+                _ = self.control.pause_changed() => return,
+                _ = tokio::time::sleep(Duration::from_millis(150).min(until - Instant::now())) => {}
+            }
         }
     }
 
@@ -400,11 +412,15 @@ impl Run {
         if !self.ranges_ok.load(Ordering::SeqCst) || self.single.load(Ordering::SeqCst) {
             return;
         }
+        self.dirty.swap(false, Ordering::SeqCst);
         let (total, remaining) = {
             let m = lock(&self.map);
             match m.total() {
                 Some(t) => (t, m.journal_ranges()),
-                None => return,
+                None => {
+                    self.dirty.store(true, Ordering::SeqCst);
+                    return;
+                }
             }
         };
         let j = {
@@ -412,14 +428,16 @@ impl Run {
             Journal::new(&self.key, total, meta.etag.clone(), meta.last_modified.clone(), remaining)
         };
         let (data, path, durable) = (self.data.clone(), self.journal.clone(), self.dl.config.durable);
-        self.dirty.store(false, Ordering::SeqCst);
-        let _ = tokio::task::spawn_blocking(move || {
+        let saved = tokio::task::spawn_blocking(move || {
             if durable {
                 file::sync(&data)?;
             }
             j.save(&path)
         })
         .await;
+        if !matches!(saved, Ok(Ok(()))) {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -523,6 +541,7 @@ async fn run_once(
         refreshed: AtomicBool::new(false),
         refresh_lock: tokio::sync::Mutex::new(()),
         dirty: AtomicBool::new(false),
+        journal_now: AtomicBool::new(false),
         resumed,
         dest_is_html,
         job,
@@ -590,16 +609,24 @@ async fn monitor(run: Arc<Run>) -> Result<Outcome, Error> {
             measure(&run, &cfg, &mut last_bytes, last_speed.elapsed());
             last_speed = Instant::now();
         }
-        if run.dirty.load(Ordering::SeqCst) && last_journal.elapsed() >= cfg.journal_interval {
+        let urgent_checkpoint = run.journal_now.swap(false, Ordering::SeqCst)
+            || run.control.is_paused();
+        if run.dirty.load(Ordering::SeqCst)
+            && (urgent_checkpoint || last_journal.elapsed() >= Duration::from_secs(1))
+        {
             run.save_journal().await;
             last_journal = Instant::now();
         }
         if set.is_empty() {
-            tokio::time::sleep(TICK).await;
+            tokio::select! {
+                _ = run.control.cancelled() => {},
+                _ = tokio::time::sleep(TICK) => {}
+            }
         } else {
             tokio::select! {
-                _ = tokio::time::sleep(TICK) => {}
-                _ = set.join_next() => {}
+                _ = run.control.cancelled() => {},
+                _ = tokio::time::sleep(TICK) => {},
+                _ = set.join_next() => {},
             }
         }
     }
@@ -726,7 +753,10 @@ async fn worker(run: Arc<Run>, w: usize) {
     let mut guard = LiveGuard(&run, false);
     let stat = lock(&run.stats)[w].clone();
     let _permit = match &run.dl.gate {
-        Some(g) => g.clone().acquire_owned().await.ok(),
+        Some(g) => tokio::select! {
+            _ = run.control.cancelled() => return,
+            permit = g.clone().acquire_owned() => permit.ok(),
+        },
         None => None,
     };
     let mut out: Option<Arc<std::fs::File>> = None;
@@ -739,7 +769,7 @@ async fn worker(run: Arc<Run>, w: usize) {
             break;
         }
         while run.control.is_paused() && !run.stopping() {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            run.control.wait_until_resumed().await;
         }
         let claim = {
             let speeds = lock(&run.speeds).clone();
@@ -752,10 +782,16 @@ async fn worker(run: Arc<Run>, w: usize) {
         stat.active.store(true, Ordering::SeqCst);
         let mirror = run.mirror_for(w);
         let res = fetch(&run, w, &stat, claim, &mut out, mirror.as_deref()).await;
+        let segment_finished = lock(&run.map)
+            .bounds(claim.id)
+            .is_some_and(|(pos, end)| pos >= end);
+        if segment_finished || !matches!(&res, Ok(())) {
+            run.journal_now.store(true, Ordering::SeqCst);
+        }
         // A mirror that refuses or serves something else is dropped; the
         // segment goes back to the pool for the main URL or another mirror.
         let res = match (res, mirror) {
-            (Err(f), Some(m)) if !matches!(f, Fail::Cancelled | Fail::Retry { progressed: true, .. }) => {
+            (Err(f), Some(m)) if !matches!(f, Fail::Cancelled | Fail::Paused | Fail::Retry { progressed: true, .. }) => {
                 let why = match &f {
                     Fail::Fatal(e) => e.to_string(),
                     Fail::Refused { status, .. } => format!("HTTP {status}"),
@@ -771,9 +807,11 @@ async fn worker(run: Arc<Run>, w: usize) {
         stat.active.store(false, Ordering::SeqCst);
         stat.streaming.store(false, Ordering::SeqCst);
         lock(&run.map).release(claim.id, w);
+        let mut interrupted = None;
         match res {
             Ok(()) => {}
             Err(Fail::Cancelled) => break,
+            Err(Fail::Paused) => continue,
             Err(Fail::Fatal(e)) => {
                 run.set_fatal(e);
                 break;
@@ -806,10 +844,20 @@ async fn worker(run: Arc<Run>, w: usize) {
                 run.nap(wait.min(Duration::from_secs(60))).await;
             }
             Err(Fail::Refused { status, url }) => {
-                if run.on_refused(w, status, &url).await.is_err() {
+                let result = tokio::select! {
+                    _ = run.control.cancelled() => { interrupted = Some(Fail::Cancelled); None },
+                    _ = run.control.pause_changed() => { interrupted = Some(Fail::Paused); None },
+                    result = run.on_refused(w, status, &url) => Some(result),
+                };
+                if result.is_some_and(|result| result.is_err()) {
                     break;
                 }
             }
+        }
+        match interrupted {
+            Some(Fail::Cancelled) => break,
+            Some(Fail::Paused) => continue,
+            _ => {}
         }
     }
 }
@@ -853,10 +901,12 @@ async fn fetch(
     };
     let send = (run.dl.request)(&url).header(reqwest::header::RANGE, range).send();
     let answer = if run.others_healthy(w) { cfg.stall_timeout.min(BUSY_ANSWER) } else { cfg.stall_timeout };
-    let resp = match tokio::time::timeout(answer, send).await {
-        Err(_) => {
-            return Err(Fail::Retry { msg: format!("no answer in {}s", answer.as_secs()), progressed: false })
-        }
+    let resp = match tokio::select! {
+        _ = run.control.cancelled() => return Err(Fail::Cancelled),
+        _ = run.control.pause_changed() => return Err(Fail::Paused),
+        result = tokio::time::timeout(answer, send) => result,
+    } {
+        Err(_) => return Err(Fail::Retry { msg: format!("no answer in {}s", answer.as_secs()), progressed: false }),
         Ok(Err(e)) => return Err(Fail::Retry { msg: format!("network: {e}"), progressed: false }),
         Ok(Ok(r)) => r,
     };
@@ -898,6 +948,18 @@ async fn fetch(
     if partial {
         match text(reqwest::header::CONTENT_RANGE).as_deref().and_then(parse_content_range) {
             Some((a, b, total)) => {
+                // A 206 body is written at `pos` using positional I/O. Reject
+                // impossible or over-wide ranges before consuming any bytes:
+                // an over-wide response can otherwise overwrite a neighbor's
+                // concurrently downloaded segment.
+                let invalid_bounds = b < a
+                    || total.is_some_and(|t| t == 0 || b >= t)
+                    || (req_end != OPEN_END && b >= req_end);
+                if invalid_bounds {
+                    return Err(Fail::Fatal(Error::FileChanged(
+                        "the server returned an invalid Content-Range".into(),
+                    )));
+                }
                 if a != pos {
                     return Err(Fail::Retry {
                         msg: format!("the server sent bytes from {a} instead of {pos}"),
@@ -907,12 +969,14 @@ async fn fetch(
                 expected = Some(b.saturating_sub(a) + 1);
                 run.learn(total, true)?;
             }
-            None if pos == 0 => {
-                expected = resp.content_length();
-                run.learn(None, false)?;
-            }
             None => {
-                return Err(Fail::Retry { msg: "206 reply without Content-Range".into(), progressed: false });
+                // A 206 response is only safe to write when the server tells
+                // us exactly which bytes it returned. Even at offset zero,
+                // accepting a missing range header can make a malformed or
+                // intermediary response look like a valid partial file.
+                return Err(Fail::Fatal(Error::FileChanged(
+                    "the server returned 206 without a valid Content-Range".into(),
+                )));
             }
         }
     } else {
@@ -967,17 +1031,30 @@ async fn fetch(
     let mut got = 0u64;
     let mut body_bytes = 0u64;
     let mut stream = resp.bytes_stream();
-    let ended: Result<End, Fail> = loop {
+    let ended: Result<End, Fail> = 'stream: loop {
         if run.stopping() {
             break Err(Fail::Cancelled);
         }
         while run.control.is_paused() && !run.stopping() {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            if !buf.is_empty() {
+                if let Err(e) = flush(run, out, id, &mut buf, &mut buf_off).await {
+                    break 'stream Err(Fail::Fatal(Error::Io(e)));
+                }
+                run.journal_now.store(true, Ordering::SeqCst);
+            }
+            run.control.wait_until_resumed().await;
+        }
+        if run.stopping() {
+            break Err(Fail::Cancelled);
         }
         if stat.restart.swap(false, Ordering::SeqCst) {
             break Ok(End::Restart);
         }
-        let chunk = match tokio::time::timeout(cfg.stall_timeout, stream.next()).await {
+        let chunk = match tokio::select! {
+            _ = run.control.cancelled() => break Err(Fail::Cancelled),
+            _ = run.control.pause_changed() => break Err(Fail::Paused),
+            result = tokio::time::timeout(cfg.stall_timeout, stream.next()) => result,
+        } {
             Err(_) => {
                 break Err(Fail::Retry {
                     msg: format!("stalled: no data for {}s", cfg.stall_timeout.as_secs()),
@@ -1005,7 +1082,11 @@ async fn fetch(
             stat.bytes.fetch_add(acc as u64, Ordering::SeqCst);
             *lock(&stat.last_byte) = Some(Instant::now());
             if let Some(l) = &run.dl.limiter {
-                l.consume(acc as u64).await;
+                tokio::select! {
+                    _ = run.control.cancelled() => break Err(Fail::Cancelled),
+                    _ = run.control.pause_changed() => break Err(Fail::Paused),
+                    _ = l.consume(acc as u64) => {},
+                }
             }
         }
         if acc < data.len() {

@@ -22,186 +22,14 @@ use std::time::{Duration, Instant};
 const SW: f32 = 520.0;
 /// Opening height; the window then fits itself to its rows.
 const SH: f32 = 470.0;
-const BROWSERS: &[&str] = crate::platform::HOST_BROWSERS;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Part {
-    Connection,
-    Extension,
-    YtDlp,
-    Ffmpeg,
-    Deno,
-}
-
-impl Part {
-    const ALL: [Part; 5] = [Part::Connection, Part::Extension, Part::YtDlp, Part::Ffmpeg, Part::Deno];
-    fn title(self) -> &'static str {
-        match self {
-            Part::Connection => "Browser connection",
-            Part::Extension => "Browser extension",
-            Part::YtDlp => "yt-dlp",
-            Part::Ffmpeg => "FFmpeg",
-            Part::Deno => "Deno",
-        }
-    }
-    fn purpose(self) -> &'static str {
-        match self {
-            Part::Connection => "Lets the extension hand downloads to the app",
-            Part::Extension => "Download buttons on videos, and capturing downloads",
-            Part::YtDlp => "Downloads from YouTube and 1,000+ video sites",
-            Part::Ffmpeg => "Joins video and sound (YouTube above 360p)",
-            Part::Deno => "Runs YouTube's player check",
-        }
-    }
-    /// Fixed by the app itself (the extension needs the user's browser).
-    fn automatic(self) -> bool {
-        self != Part::Extension
-    }
-}
-
-#[derive(Clone, PartialEq, Debug)]
-enum State {
-    Checking,
-    Ready(String),
-    Missing(String),
-    Working(String),
-    Failed(String),
-}
-
-impl State {
-    fn ready(&self) -> bool {
-        matches!(self, State::Ready(_))
-    }
-}
-
-/// Worker → window.
-enum Msg {
-    State(Part, State),
-    Idle,
-}
-
-/// When the extension last talked to the app (written by the native host).
-fn extension_seen() -> Option<chrono::DateTime<chrono::FixedOffset>> {
-    let p = crate::model::config_dir()?.join("extension_seen.json");
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()?;
-    chrono::DateTime::parse_from_rfc3339(v.get("at")?.as_str()?).ok()
-}
-
-/// The state of one part (blocking: version probes run here).
-fn check(part: Part) -> State {
-    match part {
-        Part::Connection => {
-            let ok: Vec<&str> = BROWSERS.iter().copied().filter(|b| crate::app::native_host_status(b)).collect();
-            if ok.len() == BROWSERS.len() {
-                State::Ready("Chrome, Edge, Brave, Opera, Vivaldi and Firefox".into())
-            } else if ok.is_empty() {
-                State::Missing("Not set up for any browser".into())
-            } else {
-                State::Missing(format!("Missing for {}", BROWSERS.iter().filter(|b| !ok.contains(b)).copied().collect::<Vec<_>>().join(", ")))
-            }
-        }
-        Part::Extension => match extension_seen() {
-            Some(t) => State::Ready(format!("Connected · last seen {}", crate::model::relative_time(&t.with_timezone(&chrono::Local)))),
-            None => State::Missing("Not added to a browser yet (or the browser has not been opened since)".into()),
-        },
-        Part::YtDlp => {
-            let i = crate::engine::ytdlp_info();
-            match (i.path, i.version) {
-                (Some(_), Some(v)) => State::Ready(format!("Version {v}")),
-                (Some(_), None) => State::Ready("Installed".into()),
-                _ => State::Missing("Not installed".into()),
-            }
-        }
-        Part::Ffmpeg => {
-            let i = crate::engine::ffmpeg_info();
-            match (i.path, i.version) {
-                (Some(_), Some(v)) => State::Ready(format!("Version {}", v.split_whitespace().next().unwrap_or(&v))),
-                (Some(_), None) => State::Ready("Installed".into()),
-                _ => State::Missing("Not installed".into()),
-            }
-        }
-        Part::Deno => match crate::engine::js_runtime_name() {
-            Some(name) => State::Ready(format!("Using {name}")),
-            None => State::Missing("Not installed".into()),
-        },
-    }
-}
-
-/// Fix one part (blocking).
-fn fix(part: Part) -> Result<(), String> {
-    match part {
-        Part::Connection => {
-            let mut errs = Vec::new();
-            for b in BROWSERS {
-                if let Err(e) = crate::app::install_native_host(b) {
-                    errs.push(format!("{b}: {e}"));
-                }
-            }
-            if errs.len() == BROWSERS.len() { Err(errs.join("; ")) } else { Ok(()) }
-        }
-        Part::YtDlp => crate::engine::ytdlp_refresh_blocking().map(|_| ()).map_err(|e| format!("{e:#}")),
-        Part::Ffmpeg => crate::engine::ffmpeg_refresh_blocking().map(|_| ()).map_err(|e| format!("{e:#}")),
-        Part::Deno => crate::engine::deno_install_blocking().map(|_| ()).map_err(|e| format!("{e:#}")),
-        Part::Extension => Ok(()),
-    }
-}
-
-fn working_text(part: Part) -> &'static str {
-    match part {
-        Part::Connection => "Setting up…",
-        _ => "Downloading…",
-    }
-}
-
-/// Run `parts` one after another on a worker thread, re-checking each.
-fn run_fixes(tx: Sender<Msg>, parts: Vec<Part>) {
-    std::thread::spawn(move || {
-        for part in parts {
-            let _ = tx.send(Msg::State(part, State::Working(working_text(part).into())));
-            let state = match fix(part) {
-                Ok(()) => check(part),
-                Err(e) => State::Failed(e),
-            };
-            let _ = tx.send(Msg::State(part, state));
-        }
-        let _ = tx.send(Msg::Idle);
-    });
-}
-
-fn run_checks(tx: Sender<Msg>, parts: Vec<Part>) {
-    std::thread::spawn(move || {
-        for part in parts {
-            let _ = tx.send(Msg::State(part, check(part)));
-        }
-        let _ = tx.send(Msg::Idle);
-    });
-}
-
-/// The helpers' lines for the About window: (name, detail, ready).
-/// Blocking (version probes): call it from a worker thread.
-pub fn helper_lines() -> Vec<(&'static str, String, bool)> {
-    [Part::YtDlp, Part::Ffmpeg, Part::Deno]
-        .into_iter()
-        .map(|p| match check(p) {
-            State::Ready(d) => (p.title(), d, true),
-            State::Missing(d) | State::Failed(d) | State::Working(d) => (p.title(), d, false),
-            State::Checking => (p.title(), String::new(), false),
-        })
-        .collect()
-}
-
-/// Whether the start-up window is worth showing: something is missing.
-/// Cheap (no version probes): file and registration checks only.
-pub fn something_missing() -> bool {
-    !crate::engine::helpers_present()
-        || extension_seen().is_none()
-        || !BROWSERS.iter().any(|b| crate::app::native_host_status(b))
-}
+pub(crate) use crate::setup_service::{
+    check, extension_directory, helper_lines, something_missing, run_checks, run_fixes, Msg, Part, State,
+};
 
 /// Open the window (its own process). `auto` starts the automatic fixes.
 pub fn spawn(auto: bool) {
     let Ok(exe) = crate::platform::launch_path() else { return };
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = crate::platform::silent_command(exe);
     cmd.arg("--setup");
     if auto {
         cmd.arg("--auto");
@@ -274,7 +102,7 @@ pub fn run() -> eframe::Result<()> {
         tx,
         rx,
         busy: true,
-        show_at_start: crate::model::ui_pref_bool("setup_at_start", true),
+        show_at_start: crate::model::ui_pref_bool("setup_at_start", false),
         placed: false,
         last_ext_check: Instant::now(),
         win_h: SH,

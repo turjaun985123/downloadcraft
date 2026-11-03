@@ -164,6 +164,7 @@ fn opts_for(item: &DownloadItem, limit_bps: u64) -> EngineOpts {
     o.max_retries = item.eff_retries(o.max_retries);
     o.referer = item.referer.clone();
     o.cookie = item.cookie.clone();
+    o.cookie_scope = crate::engine::CredentialScope::for_url(&item.url);
     o.captured_headers = crate::engine::CapturedHeaders::for_url(&item.url, &item.extra_headers);
     o.browser = item.browser.clone();
     o.log_key = item.id.to_string();
@@ -181,7 +182,7 @@ fn opts_for(item: &DownloadItem, limit_bps: u64) -> EngineOpts {
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::RegisterBrowser {browser} => {
-            println!("{}",crate::app::install_native_host(&browser).map_err(anyhow::Error::msg)?);
+            println!("{}",crate::integration::install_native_host(&browser).map_err(anyhow::Error::msg)?);
             Ok(())
         }
 

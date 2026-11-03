@@ -12,7 +12,9 @@
 use crate::app::pl;
 use crate::dm::*;
 use crate::fonts::{reg, semi};
-use crate::model::{claim_window, config_dir, format_bytes};
+use crate::model::{claim_window, format_bytes};
+use crate::about_service::{read_release, read_state, send, Release, UpdState};
+pub(crate) use crate::about_service::{gpui_request, gpui_snapshot, GpuiSnapshot};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
@@ -21,36 +23,11 @@ const AW: f32 = 520.0;
 const AH: f32 = 560.0;
 const REPO: &str = "https://github.com/hungry-detective/downloadcraft";
 
-/// Keep what the About window shows about the newest release: its tag, page
-/// and the first few headline points of its notes.
-pub fn save_release_info(v: &serde_json::Value, newer: bool) {
-    let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("");
-    let highlights: Vec<String> = body
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("- "))
-        .map(|l| {
-            let l = l.trim_start_matches("- ").replace("**", "");
-            // "Updates itself: when a new release…" → "Updates itself".
-            let head = l.split(": ").next().unwrap_or(&l).trim().to_string();
-            if head.chars().count() > 90 { head.chars().take(88).collect::<String>() + "…" } else { head }
-        })
-        .take(3)
-        .collect();
-    let info = serde_json::json!({
-        "tag": v.get("tag_name").and_then(|t| t.as_str()).unwrap_or(""),
-        "url": v.get("html_url").and_then(|t| t.as_str()).unwrap_or(""),
-        "highlights": highlights,
-        "newer": newer,
-    });
-    if let Some(p) = config_dir().map(|d| d.join("release_info.json")) {
-        let _ = crate::model::atomic_write(&p, info.to_string().as_bytes());
-    }
-}
+pub(crate) use crate::about_service::save_release_info;
 
 pub fn spawn() {
     let Ok(exe) = crate::platform::launch_path() else { return };
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = crate::platform::silent_command(exe);
     cmd.arg("--about");
     #[cfg(windows)]
     {
@@ -58,68 +35,6 @@ pub fn spawn() {
         cmd.creation_flags(0x0000_0008);
     }
     let _ = cmd.spawn();
-}
-
-/// A button's order for the main window (its `cmd.json`).
-fn send(action: &str) {
-    let Some(p) = config_dir().map(|d| d.join("cmd.json")) else { return };
-    let _guard = crate::model::fs_lock("cmd");
-    if !_guard.owned() {
-        return;
-    }
-    let mut v: serde_json::Value = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!([]));
-    if let Some(arr) = v.as_array_mut() {
-        arr.push(serde_json::json!({ "action": action }));
-        let _ = crate::model::atomic_write(&p, v.to_string().as_bytes());
-    }
-}
-
-#[derive(Default, Clone)]
-struct UpdState {
-    phase: String,
-    status: String,
-    size: u64,
-    running: u64,
-}
-
-#[derive(Default, Clone)]
-struct Release {
-    tag: String,
-    url: String,
-    highlights: Vec<String>,
-    newer: bool,
-}
-
-fn read_json(name: &str) -> Option<serde_json::Value> {
-    let p = config_dir()?.join(name);
-    serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
-}
-
-fn read_state() -> UpdState {
-    let Some(v) = read_json("update_state.json") else { return UpdState::default() };
-    UpdState {
-        phase: v.get("phase").and_then(|x| x.as_str()).unwrap_or("idle").into(),
-        status: v.get("status").and_then(|x| x.as_str()).unwrap_or("").into(),
-        size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
-        running: v.get("running").and_then(|x| x.as_u64()).unwrap_or(0),
-    }
-}
-
-fn read_release() -> Release {
-    let Some(v) = read_json("release_info.json") else { return Release::default() };
-    Release {
-        tag: v.get("tag").and_then(|x| x.as_str()).unwrap_or("").trim_start_matches('v').into(),
-        url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").into(),
-        highlights: v
-            .get("highlights")
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|h| h.as_str().map(String::from)).collect())
-            .unwrap_or_default(),
-        newer: v.get("newer").and_then(|x| x.as_bool()).unwrap_or(false),
-    }
 }
 
 /// "Downloading update… 45%" → 0.45.

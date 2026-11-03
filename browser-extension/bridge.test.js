@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(__dirname + '/bridge.js', 'utf8');
 
-function load() {
+function load(overrides = {}) {
   const listeners = {};
   const posted = [];
   let portMsg, portGone;
@@ -14,12 +14,12 @@ function load() {
   const chrome = {
     runtime: {
       lastError: null,
-      connectNative: () => ({
+      connectNative: overrides.connectNative || (() => ({
         onMessage: { addListener: (f) => { portMsg = f; } },
         onDisconnect: { addListener: (f) => { portGone = f; } },
         postMessage: (m) => posted.push(m),
-      }),
-      sendNativeMessage: async (h, m) => ({ type: 'ok', via: 'oneshot', m }),
+      })),
+      sendNativeMessage: overrides.sendNativeMessage || (async (h, m) => ({ type: 'ok', via: 'oneshot', m })),
     },
     webRequest: {
       onBeforeRequest: ev('before'), onSendHeaders: ev('headers'),
@@ -100,4 +100,59 @@ test('without the live port every request still goes through the one-shot host',
   const { B } = load();
   const r = await B.send({ type: 'ping' });
   assert.equal(r.via, 'oneshot');
+});
+
+test('a capture keeps one stable id across retries of the same request object', async () => {
+  const { B } = load();
+  const request = { type: 'download', url: 'https://example.test/file.zip' };
+  const first = await B.send(request);
+  const retry = await B.send(request);
+  assert.match(first.m.captureId, /^[a-z0-9-]{8,96}$/i);
+  assert.equal(retry.m.captureId, first.m.captureId);
+  const nextCapture = await B.send({ ...request });
+  assert.notEqual(nextCapture.m.captureId, first.m.captureId);
+});
+
+test('a live-port failure retries the same capture id through the one-shot host', async () => {
+  const { B, posted, port, gone } = load();
+  const hello = posted.find((m) => m.type === 'hello');
+  port()({ type: 'pong', version: 2, rid: hello.rid });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(B.live(), true);
+
+  const request = { type: 'download', url: 'https://example.test/retry.zip' };
+  const sent = B.send(request);
+  await new Promise((r) => setTimeout(r, 5));
+  const persistent = posted.find((m) => m.type === 'download');
+  assert.ok(persistent && persistent.captureId);
+
+  gone()();
+  const fallback = await sent;
+  assert.equal(fallback.via, 'oneshot');
+  assert.equal(fallback.m.captureId, persistent.captureId);
+});
+
+test('one-shot native messaging retries transient failures with the same request id', async () => {
+  let attempts = 0;
+  const { B } = load({ sendNativeMessage: async (host, message) => {
+    attempts++;
+    if (attempts < 3) throw new Error('host is starting');
+    return { type: 'ok', attempts, message };
+  } });
+  const request = { type: 'download', url: 'https://example.test/retry.zip' };
+  const reply = await B.send(request);
+  assert.equal(attempts, 3);
+  assert.equal(reply.message.captureId, (await B.send(request)).message.captureId);
+});
+
+test('native port connection retries transient startup failures', async () => {
+  let attempts = 0;
+  const { posted } = load({ connectNative: () => {
+    attempts++;
+    if (attempts < 3) throw new Error('host is starting');
+    return { onMessage: { addListener() {} }, onDisconnect: { addListener() {} }, postMessage: (m) => posted.push(m) };
+  } });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(attempts, 3);
+  assert.ok(posted.some((message) => message.type === 'hello'));
 });

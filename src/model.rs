@@ -56,7 +56,13 @@ impl FsGuard {
     }
 }
 pub fn fs_lock(name: &str) -> FsGuard {
-    fn acquire(name: &str) -> Option<std::fs::File> {
+    fs_lock_timeout(name, std::time::Duration::from_secs(2))
+}
+
+/// Acquire a shared state lock for at most `timeout`. Shutdown uses this
+/// bounded variant so another short-lived helper cannot hold the GUI open.
+pub fn fs_lock_timeout(name: &str, timeout: std::time::Duration) -> FsGuard {
+    fn acquire(name: &str, timeout: std::time::Duration) -> Option<std::fs::File> {
         let path = config_dir()?.join(format!("{name}.lock"));
         std::fs::create_dir_all(path.parent()?).ok()?;
         let file = std::fs::OpenOptions::new()
@@ -66,19 +72,23 @@ pub fn fs_lock(name: &str) -> FsGuard {
             .truncate(false)
             .open(path)
             .ok()?;
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
             match file.try_lock() {
                 Ok(()) => return Some(file),
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return None;
+                    }
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
                 }
                 Err(_) => return None,
             }
         }
-        None
     }
     FsGuard {
-        _file: acquire(name),
+        _file: acquire(name, timeout),
     }
 }
 
@@ -92,13 +102,63 @@ pub fn touch_heartbeat() {
         }
         let _ = std::fs::write(&p, chrono::Local::now().to_rfc3339());
     }
+    set_app_lifecycle("running");
 }
 
 /// The main window is closing: say so at once, so a capture dialog opened
 /// right after does not take the app for running.
 pub fn clear_heartbeat() {
+    set_app_lifecycle("closing");
     if let Some(p) = config_dir().map(|d| d.join("main.lock")) {
         let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Persist the GUI lifecycle separately from native-host availability.
+pub fn set_app_lifecycle(state: &str) {
+    if !matches!(state, "starting" | "running" | "closing") {
+        return;
+    }
+    let Some(path) = config_dir().map(|d| d.join("app_lifecycle.json")) else {
+        return;
+    };
+    let body = serde_json::json!({
+        "state": state,
+        "at": chrono::Local::now().to_rfc3339(),
+    });
+    if let Ok(bytes) = serde_json::to_vec(&body) {
+        let _ = atomic_write(&path, &bytes);
+    }
+}
+
+/// Fresh GUI state for the extension: the native host itself can stay alive
+/// while the desktop window is closed.
+pub fn app_lifecycle_state() -> String {
+    let Some(path) = config_dir().map(|d| d.join("app_lifecycle.json")) else {
+        return "not_running".into();
+    };
+    let Some(value) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return if is_main_live() { "running" } else { "not_running" }.into();
+    };
+    let state = value.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    let at = value
+        .get("at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+    let Some(at) = at else {
+        return if is_main_live() { "running" } else { "not_running" }.into();
+    };
+    let age = chrono::Local::now().timestamp() - at.timestamp();
+    if age < -5 || age > 12 {
+        return "not_running".into();
+    }
+    if matches!(state, "starting" | "running" | "closing") {
+        state.into()
+    } else {
+        "not_running".into()
     }
 }
 
@@ -687,83 +747,35 @@ pub fn claim_window(name: &str) -> Option<std::fs::File> {
     Some(file)
 }
 
-/// The monitor's work area in points: the desktop minus the taskbar (and any
-/// other docked bar), so a window centred inside it can never end up half
-/// behind the taskbar. Falls back to the whole monitor when the work area is
-/// not known yet.
-pub fn work_area_rect(ctx: &egui::Context) -> Option<egui::Rect> {
-    let monitor = ctx.input(|i| i.viewport().monitor_size);
+/// Check whether another process currently owns a standalone-window slot.
+/// The probe's file handle is dropped before this function returns.
+pub fn window_is_claimed(name: &str) -> bool {
+    let dir = match config_dir() {
+        Some(dir) => dir.join("win"),
+        None => return false,
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
     #[cfg(windows)]
     {
-        let scale = ctx
-            .input(|i| i.viewport().native_pixels_per_point)
-            .filter(|s| *s > 0.05);
-        if let (Some(scale), Some((l, t, r, b))) = (scale, primary_work_area_px()) {
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(l / scale, t / scale),
-                egui::pos2(r / scale, b / scale),
-            );
-            // egui reports monitor_size in points; if the scaled work area
-            // disagrees with it wildly the scale factor was wrong (mixed DPI),
-            // so prefer the monitor rectangle in that case.
-            let plausible = match monitor {
-                Some(m) => {
-                    rect.width() > m.x * 0.25
-                        && rect.width() < m.x * 2.5
-                        && rect.height() > m.y * 0.25
-                        && rect.height() < m.y * 2.5
-                }
-                None => rect.width() > 200.0 && rect.height() > 200.0,
-            };
-            if plausible {
-                return Some(rect);
-            }
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+        opts.open(dir.join(name)).is_err()
+    }
+    #[cfg(unix)]
+    {
+        let Ok(file) = opts.open(dir.join(name)) else {
+            return false;
+        };
+        match file.try_lock() {
+            Ok(()) => false,
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(_) => false,
         }
     }
-    monitor.map(|m| egui::Rect::from_min_size(egui::Pos2::ZERO, m))
-}
-
-/// `SPI_GETWORKAREA` of the primary monitor, in physical pixels.
-#[cfg(windows)]
-fn primary_work_area_px() -> Option<(f32, f32, f32, f32)> {
-    #[repr(C)]
-    struct Rect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    }
-    const SPI_GETWORKAREA: u32 = 0x0030;
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn SystemParametersInfoW(
-            action: u32,
-            param: u32,
-            data: *mut std::ffi::c_void,
-            win_ini: u32,
-        ) -> i32;
-    }
-    let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
-    let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut _ as *mut _, 0) };
-    (ok != 0).then(|| (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32))
-}
-
-/// Put a fixed-size window in the middle of the work area. Returns `false`
-/// while the monitor geometry is still unknown so callers retry next frame
-/// instead of latching a bad position (Windows cascades otherwise).
-pub fn center_window(ctx: &egui::Context, size: egui::Vec2) -> bool {
-    let Some(work) = work_area_rect(ctx) else {
-        return false;
-    };
-    if work.width() < 120.0 || work.height() < 120.0 {
-        return false;
-    }
-    // Clamp to the top-left corner: a window taller than the work area should
-    // hug the top edge rather than run off the bottom.
-    let x = (work.center().x - size.x / 2.0).max(work.min.x);
-    let y = (work.center().y - size.y / 2.0).max(work.min.y);
-    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
-    true
 }
 
 /// Read a boolean preference out of ui.json (the main app's settings file)
@@ -785,6 +797,46 @@ pub fn ui_pref_str(key: &str, default: &str) -> String {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get(key).and_then(|x| x.as_str()).map(str::to_string))
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Read a numeric preference from ui.json, with a default for older configs.
+pub fn ui_pref_u64(key: &str, default: u64) -> u64 {
+    config_dir()
+        .and_then(|p| std::fs::read_to_string(p.join("ui.json")).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get(key).and_then(|x| x.as_u64()))
+        .unwrap_or(default)
+}
+
+/// Read a structured preference from ui.json for migrated GPUI settings.
+pub fn ui_pref_value(key: &str) -> Option<serde_json::Value> {
+    config_dir()
+        .and_then(|path| std::fs::read_to_string(path.join("ui.json")).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get(key).cloned())
+}
+
+/// Merge a structured preference into ui.json while preserving settings
+/// written by the main window or another settings page.
+pub fn ui_pref_set_value(key: &str, value: serde_json::Value) {
+    let guard = fs_lock("ui-settings");
+    if !guard.owned() {
+        return;
+    }
+    let Some(path) = config_dir().map(|dir| dir.join("ui.json")) else {
+        return;
+    };
+    let mut stored: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(object) = stored.as_object_mut() else {
+        return;
+    };
+    object.insert(key.to_string(), value);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
+        let _ = atomic_write(&path, &bytes);
+    }
 }
 
 /// Merge one boolean into ui.json, leaving every other key alone. The main app
@@ -811,6 +863,10 @@ pub fn ui_pref_set_bool(key: &str, value: bool) {
 /// Merge one string into ui.json (used when an action commits a helper choice
 /// right away, e.g. "Re-download" switching to the app's own ffmpeg).
 pub fn ui_pref_set_str(key: &str, value: &str) {
+    let _guard = fs_lock("ui-settings");
+    if !_guard.owned() {
+        return;
+    }
     let Some(p) = config_dir().map(|d| d.join("ui.json")) else {
         return;
     };
@@ -824,6 +880,30 @@ pub fn ui_pref_set_str(key: &str, value: &str) {
     obj.insert(key.to_string(), serde_json::Value::String(value.to_string()));
     if let Ok(json) = serde_json::to_string_pretty(&v) {
         let _ = atomic_write(&p, json.as_bytes());
+    }
+}
+
+/// Merge a numeric preference into ui.json without replacing settings written
+/// by another window. GPUI's settings view and the legacy settings window use
+/// the same lock and file format during the UI migration.
+pub fn ui_pref_set_u64(key: &str, value: u64) {
+    let _guard = fs_lock("ui-settings");
+    if !_guard.owned() {
+        return;
+    }
+    let Some(path) = config_dir().map(|dir| dir.join("ui.json")) else {
+        return;
+    };
+    let mut value_json: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(object) = value_json.as_object_mut() else {
+        return;
+    };
+    object.insert(key.to_string(), serde_json::Value::from(value));
+    if let Ok(bytes) = serde_json::to_vec_pretty(&value_json) {
+        let _ = atomic_write(&path, &bytes);
     }
 }
 
@@ -1578,19 +1658,14 @@ pub fn pick_windows_asset(v: &serde_json::Value) -> Option<String> {
         let l = n.to_ascii_lowercase();
         l.contains("x86_64") || l.contains("x64")
     };
-    // Portable build first, then any 64-bit windows zip, then any windows
-    // zip, then any zip at all.
+    // Portable build first, then any 64-bit Windows zip, then any Windows
+    // zip. A Linux/macOS or source zip is never installed on Windows.
     let portable = names
         .iter()
         .find(|(n, _)| is_zip(n) && is_win(n) && n.to_ascii_lowercase().contains("portable"));
     let win64 = names.iter().find(|(n, _)| is_zip(n) && is_win(n) && is_64(n));
     let win = names.iter().find(|(n, _)| is_zip(n) && is_win(n));
-    let any = names.iter().find(|(n, _)| is_zip(n));
-    portable
-        .or(win64)
-        .or(win)
-        .or(any)
-        .map(|(_, u)| u.to_string())
+    portable.or(win64).or(win).map(|(_, u)| u.to_string())
 }
 
 #[cfg(test)]

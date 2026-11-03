@@ -2430,6 +2430,45 @@ pub struct CraftApp {
     status_open: bool,
 }
 
+impl Drop for CraftApp {
+    fn drop(&mut self) {
+        crate::model::set_app_lifecycle("closing");
+        self.tray = None;
+        for task in self.tasks.values() {
+            task.shared.cancel();
+        }
+        if let Some(prestart) = self.add_pre.take() {
+            prestart.shared.cancel();
+            prestart.handle.abort();
+        }
+        for item in &mut self.downloads {
+            if let Some(task) = self.tasks.get(&item.id) {
+                item.downloaded_bytes = task.shared.downloaded.load(Ordering::SeqCst);
+                if task.shared.has_total.load(Ordering::SeqCst) {
+                    item.total_bytes = Some(task.shared.total.load(Ordering::SeqCst));
+                }
+                item.speed_bps = 0.0;
+                if matches!(item.status, Status::Downloading) {
+                    item.status = Status::Paused;
+                }
+            }
+        }
+        self.save_queue();
+        // The normal snapshot writer is rate-limited for frame-loop use;
+        // shutdown must publish the final state even if a frame wrote just
+        // before the window closed.
+        self.last_prog_write = Instant::now() - std::time::Duration::from_secs(1);
+        self.write_progress_snapshot();
+
+        // Give cooperative cancellation a brief window to flush network
+        // buffers and atomically checkpoint resumable ranges.
+        let deadline = Instant::now() + std::time::Duration::from_millis(200);
+        while self.tasks.values().any(|task| !task.handle.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
 impl CraftApp {
     pub fn new(rt: Arc<tokio::runtime::Runtime>) -> Self {
         let _ = app_opened_at(); // pin "opened" to start-up
@@ -2624,7 +2663,7 @@ impl CraftApp {
         // Zero-config browser integration: the native host always points
         // at this binary (silent unless something needed fixing).
         for b in crate::platform::HOST_BROWSERS {
-            match ensure_native_host(b) {
+            match crate::integration::ensure_native_host(b) {
                 Ok(true) => app.push_log(format!("Browser host ready for {b}.")),
                 Err(e) => app.push_log(format!("Browser host ({b}) unavailable: {e}")),
                 Ok(false) => {}
@@ -2801,7 +2840,7 @@ impl CraftApp {
     /// window silently never appearing.
     fn spawn_progress(id: u64) -> std::io::Result<()> {
         let started = crate::platform::launch_path().and_then(|exe| {
-            let mut cmd = std::process::Command::new(exe);
+            let mut cmd = crate::platform::silent_command(exe);
             cmd.arg("--progress").arg(id.to_string());
             #[cfg(windows)]
             {
@@ -2818,7 +2857,7 @@ impl CraftApp {
         let Ok(exe) = crate::platform::launch_path() else {
             return;
         };
-        let mut cmd = std::process::Command::new(exe);
+        let mut cmd = crate::platform::silent_command(exe);
         cmd.arg("--complete").arg(id.to_string());
         #[cfg(windows)]
         {
@@ -2861,7 +2900,7 @@ impl CraftApp {
         let Ok(exe) = crate::platform::launch_path() else {
             return;
         };
-        let mut cmd = std::process::Command::new(exe);
+        let mut cmd = crate::platform::silent_command(exe);
         cmd.arg("--settings");
         #[cfg(windows)]
         {
@@ -3447,6 +3486,7 @@ impl CraftApp {
             },
             referer: d.referer.clone(),
             cookie: d.cookie.clone(),
+            cookie_scope: crate::engine::CredentialScope::for_url(&d.url),
             captured_headers: crate::engine::CapturedHeaders::for_url(&d.url, &d.extra_headers),
             username: d.username.clone(),
             password: d.password.clone(),
@@ -3593,7 +3633,7 @@ impl CraftApp {
         let name = d.filename.clone();
         self.push_log(format!("Converting {name}…"));
         std::thread::spawn(move || {
-            let mut cmd = std::process::Command::new(ffmpeg);
+            let mut cmd = crate::platform::silent_command(ffmpeg);
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -4494,6 +4534,7 @@ impl CraftApp {
             },
             referer: item.referer.clone(),
             cookie: item.cookie.clone(),
+            cookie_scope: crate::engine::CredentialScope::for_url(&item.url),
             captured_headers: crate::engine::CapturedHeaders::for_url(&item.url, &item.extra_headers),
             username: item.username.clone(),
             password: item.password.clone(),
@@ -4723,9 +4764,8 @@ impl CraftApp {
             .map(|t| t.shared.live.load(Ordering::SeqCst))
             .unwrap_or(false);
         let mut stopped: Option<(String, String)> = None;
-        if let Some(t) = self.tasks.remove(&id) {
-            t.shared.cancelled.store(true, Ordering::SeqCst);
-            t.handle.abort();
+        if let Some(t) = self.tasks.get(&id) {
+            t.shared.cancel();
         }
         // The stage label belongs to the running helper, not the row.
         self.phases.remove(&id);
@@ -4852,7 +4892,14 @@ impl CraftApp {
             let ua = self.user_agent.clone();
             self.rt.spawn(async move {
                 for (id, url, referer, cookie) in rows {
-                    let opts = EngineOpts { user_agent: ua.clone(), referer, cookie, timeout_secs: 20, ..Default::default() };
+                    let opts = EngineOpts {
+                        user_agent: ua.clone(),
+                        referer,
+                        cookie_scope: crate::engine::CredentialScope::for_url(&url),
+                        cookie,
+                        timeout_secs: 20,
+                        ..Default::default()
+                    };
                     let size = match opts.build_client() {
                         Ok(c) => crate::engine::probe(&c, &opts, &url).await.0,
                         Err(_) => None,
@@ -5475,20 +5522,20 @@ impl CraftApp {
         match self.finish_action.as_str() {
             "shutdown" => {
                 self.push_log("Queue done — shutting down.");
-                let mut c = std::process::Command::new("shutdown");
+                let mut c = crate::platform::silent_command("shutdown");
                 c.args(["/s", "/t", "15", "/c", "Download Craft: downloads finished"]);
                 quiet(&mut c);
                 let _ = c.spawn();
             }
             "sleep" => {
                 self.push_log("Queue done — sleeping.");
-                let _ = std::process::Command::new("rundll32.exe")
+                let _ = crate::platform::silent_command("rundll32.exe")
                     .args(["powrprof.dll,SetSuspendState", "0,1,0"])
                     .spawn();
             }
             "hibernate" => {
                 self.push_log("Queue done — hibernating.");
-                let mut c = std::process::Command::new("shutdown");
+                let mut c = crate::platform::silent_command("shutdown");
                 c.args(["/h"]);
                 quiet(&mut c);
                 let _ = c.spawn();
@@ -5872,10 +5919,10 @@ pub(crate) fn open_path(path: &std::path::Path, reveal: bool) {
         } else if let Some(parent) = path.parent() {
             // The file itself is gone: the folder it was meant for is still
             // the useful answer.
-            let _ = std::process::Command::new("explorer").arg(parent).spawn();
+            let _ = crate::platform::silent_command("explorer").arg(parent).spawn();
         }
     } else if path.exists() {
-        let mut c = std::process::Command::new("cmd");
+        let mut c = crate::platform::silent_command("cmd");
         c.args(["/C", "start", "", &path.to_string_lossy()]);
         quiet(&mut c);
         let _ = c.spawn();
@@ -5895,7 +5942,7 @@ fn select_in_file_manager(path: &std::path::Path) {
     // downloaded into `Downloads\Video` made "Open folder" land in
     // `OneDrive\Documents`. `raw_arg` appends it unescaped, the documented
     // form, and the path is quoted because it may contain spaces.
-    let _ = std::process::Command::new("explorer")
+    let _ = crate::platform::silent_command("explorer")
         .raw_arg(format!("/select,\"{}\"", path.display()))
         .spawn();
 }
@@ -5903,201 +5950,8 @@ fn select_in_file_manager(path: &std::path::Path) {
 #[cfg(not(windows))]
 fn select_in_file_manager(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
-        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+        let _ = crate::platform::silent_command("xdg-open").arg(parent).spawn();
     }
-}
-
-/// Write the native-messaging manifest + launcher and register it (HKCU, no admin).
-/// Zero-config: the unpacked extension carries a pinned key, so its ID is
-/// always this value — nothing to paste.
-pub(crate) const EXTENSION_ID: &str = "pgdhmfgefjnfijmlheboncdmfhcnoikk";
-/// IDs the Edge / Opera stores give the same extension once it is listed
-/// there (each store assigns its own); the host accepts them too.
-pub(crate) const STORE_EXTENSION_IDS: &[&str] = &[];
-
-#[cfg(windows)]
-pub(crate) fn install_native_host(browser: &str) -> Result<String, String> {
-    let base = crate::model::config_dir()
-        .map(|p| p.join("native-host"))
-        .ok_or_else(|| "no config dir".to_string())?;
-    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-
-    let exe = crate::platform::launch_path().map_err(|e| e.to_string())?;
-    let bat = base.join("download_craft_host.bat");
-    // NOTE: `@echo off` is mandatory — cmd echoes every command to stdout
-    // by default, which corrupts the length-prefixed native-messaging
-    // protocol and makes Chrome report the host as unreachable.
-    std::fs::write(
-        &bat,
-        format!("@echo off\r\n\"{}\" --native-host %*\r\n", exe.display()),
-    )
-    .map_err(|e| e.to_string())?;
-    // cmd reads a .bat in the OEM code page, so a path with "č" or "ř"
-    // (often the user name) came out garbled and the host never started
-    // (issue #5). Such a path is given to the browser as the program itself;
-    // `native_host::launched_directly` recognises that launch.
-    let host = if exe.to_string_lossy().is_ascii() { bat.clone() } else { exe.clone() };
-
-    // Native host name (must match the browser extension's HOST constant).
-    const HOST_NAME: &str = "com.download_craft";
-    let manifest_path = base.join(format!("{browser}.json"));
-    let manifest = match browser {
-        "firefox" => serde_json::json!({
-            "name": HOST_NAME,
-            "description": "Download Craft native host",
-            "path": host.to_string_lossy(),
-            "type": "stdio",
-            "allowed_extensions": ["send-to-download-craft@example"]
-        }),
-        _ => serde_json::json!({
-            "name": HOST_NAME,
-            "description": "Download Craft native host",
-            "path": host.to_string_lossy(),
-            "type": "stdio",
-            "allowed_origins": std::iter::once(EXTENSION_ID)
-                .chain(STORE_EXTENSION_IDS.iter().copied())
-                .map(|id| format!("chrome-extension://{id}/"))
-                .collect::<Vec<_>>()
-        }),
-    };
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-
-    let key = native_host_key(browser);
-    let mut rc = std::process::Command::new("reg");
-    rc.args(["add", key, "/ve", "/d", &manifest_path.to_string_lossy(), "/f"]);
-    quiet(&mut rc);
-    let out = rc.output().map_err(|e| format!("reg failed: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).to_string());
-    }
-    // Best-effort cleanup of the legacy host registration.
-    let legacy_key = legacy_host_key(browser);
-    let mut rc = std::process::Command::new("reg");
-    rc.args(["delete", legacy_key, "/f"]);
-    quiet(&mut rc);
-    let _ = rc.output();
-    Ok(manifest_path.to_string_lossy().to_string())
-}
-
-#[cfg(not(windows))]
-pub(crate) fn install_native_host(browser: &str) -> Result<String,String> { crate::platform::install_native_host(browser) }
-
-/// Whether `browser` has this app registered as its native host: the
-/// registration exists and its manifest file is still on disk.
-#[cfg(windows)]
-pub(crate) fn native_host_status(browser: &str) -> bool {
-    registry_default(native_host_key(browser)).is_some_and(|p| std::path::Path::new(&p).is_file())
-}
-
-/// The default value of an `HKCU\…` key, read as Unicode. `reg query`
-/// prints in the OEM code page, which garbled non-ASCII manifest paths.
-#[cfg(windows)]
-fn registry_default(key: &str) -> Option<String> {
-    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
-    let sub = key.strip_prefix(r"HKCU\")?;
-    let wide: Vec<u16> = sub.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut buf = vec![0u16; 1024];
-    let mut len = (buf.len() * 2) as u32;
-    // SAFETY: `wide` is NUL-terminated and `buf`/`len` describe a writable
-    // buffer; a null value name reads the key's default value.
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            wide.as_ptr(),
-            std::ptr::null(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            buf.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    let chars = (len as usize / 2).min(buf.len());
-    Some(String::from_utf16_lossy(&buf[..chars]).trim_end_matches('\0').to_string())
-}
-
-#[cfg(not(windows))]
-pub(crate) fn native_host_status(browser: &str) -> bool {
-    crate::platform::native_host_directory(browser)
-        .map(|d| d.join("com.download_craft.json").is_file())
-        .unwrap_or(false)
-}
-
-/// Registry key for a Chromium-family / Firefox native host (HKCU, no admin).
-/// Opera / Brave / Vivaldi share the Chromium layout with vendor keys.
-fn native_host_key(browser: &str) -> &'static str {
-    match browser {
-        "chrome" => r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.download_craft",
-        "edge" => r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.download_craft",
-        "brave" => r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.download_craft",
-        "opera" => r"HKCU\Software\Opera Software\NativeMessagingHosts\com.download_craft",
-        "vivaldi" => r"HKCU\Software\Vivaldi\NativeMessagingHosts\com.download_craft",
-        _ => r"HKCU\Software\Mozilla\NativeMessagingHosts\com.download_craft",
-    }
-}
-
-fn legacy_host_key(browser: &str) -> &'static str {
-    match browser {
-        "chrome" => r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.idm_rust",
-        "edge" => r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.idm_rust",
-        "brave" => r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.idm_rust",
-        "opera" => r"HKCU\Software\Opera Software\NativeMessagingHosts\com.idm_rust",
-        "vivaldi" => r"HKCU\Software\Vivaldi\NativeMessagingHosts\com.idm_rust",
-        _ => r"HKCU\Software\Mozilla\NativeMessagingHosts\com.idm_rust",
-    }
-}
-/// IDM-style zero-config: verify the native host is registered to THIS
-/// binary on every launch, reinstalling silently when missing or stale
-/// (first run, portable exe moved or renamed, etc.).
-/// Returns Ok(true) when something was (re)installed.
-/// Best-effort: failures are reported to the caller, never fatal.
-#[cfg(windows)]
-fn ensure_native_host(browser: &str) -> Result<bool, String> {
-    let base = crate::model::config_dir()
-        .map(|p| p.join("native-host"))
-        .ok_or_else(|| "no config dir".to_string())?;
-    let exe = crate::platform::launch_path().map_err(|e| e.to_string())?;
-    let exe_s = exe.to_string_lossy().into_owned();
-    let manifest_path = base.join(format!("{browser}.json"));
-    let manifest_s = manifest_path.to_string_lossy().into_owned();
-    // Fresh = manifest exists and names this exact binary, in the form
-    // `install_native_host` picks: directly, or through its launcher.
-    let direct = !exe_s.is_ascii();
-    let fresh = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| {
-            v.get("path")
-                .and_then(|p| p.as_str())
-                .map(|s| s.to_string())
-        })
-        .map(|host| {
-            if direct {
-                host == exe_s
-            } else {
-                std::fs::read_to_string(&host)
-                    .map(|c| c.contains(exe_s.as_str()))
-                    .unwrap_or(false)
-            }
-        })
-        .unwrap_or(false);
-    let registered = registry_default(native_host_key(browser)).is_some_and(|v| v == manifest_s);
-    if fresh && registered {
-        return Ok(false);
-    }
-    install_native_host(browser)?;
-    Ok(true)
-}
-
-#[cfg(not(windows))]
-fn ensure_native_host(browser:&str)->Result<bool,String>{
-    crate::platform::install_native_host(browser).map(|_|true)
 }
 
 /// Opt-in update check (P3.4, extended P5): compare the running version
@@ -6340,12 +6194,12 @@ impl eframe::App for CraftApp {
             // first start, so a new user's first video download just works.
             if !self.helpers_started {
                 self.helpers_started = true;
-                // Something missing (a helper, the browser connection, the
-                // extension): the "Get ready" window shows what, and fixes
-                // what it can at once. Otherwise helpers are only refreshed.
-                if crate::model::ui_pref_bool("setup_at_start", true) && crate::setup::something_missing() {
-                    // The window does the downloading: two processes must
-                    // not fetch the same helper into the same file.
+                // The opt-in is read as false for fresh installs. Ordinary
+                // startup checks/fetches helpers in the background; only a
+                // user who enabled the startup prompt gets a second window.
+                if crate::model::ui_pref_bool("setup_at_start", false)
+                    && crate::setup::something_missing()
+                {
                     crate::setup::spawn(true);
                 } else {
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -7551,7 +7405,7 @@ impl eframe::App for CraftApp {
         // ================= browser install result =================
         // (row/menu actions dispatch from process_hits at the end of update)
         if let Some(which) = self.pending_browser_install.take() {
-            match install_native_host(&which) {
+            match crate::integration::install_native_host(&which) {
                 Ok(manifest) => {
                     self.push_log(format!("Native host installed for {which}."));
                     self.browser_msg = format!("Installed {which} host ✓ ({manifest})");
@@ -9844,7 +9698,7 @@ impl CraftApp {
     /// whole, and the return says so). Without it everything is deleted.
     fn stop_add_prestart(&mut self, keep_as: Option<&std::path::Path>) -> bool {
         let Some(pre) = self.add_pre.take() else { return false };
-        pre.shared.cancelled.store(true, Ordering::SeqCst);
+        pre.shared.cancel();
         let finished = pre.handle.is_finished() && !crate::engine::has_partial(&pre.dest) && pre.dest.is_file();
         pre.handle.abort();
         // Let the transfer write its journal and let go of the files.
@@ -10879,7 +10733,7 @@ mod audit_completion_tests {
         success.succeeded.store(true,Ordering::SeqCst);
         assert!(task_can_complete(&success,true));
         assert!(!task_can_complete(&success,false));
-        success.cancelled.store(true,Ordering::SeqCst);
+        success.cancel();
         assert!(!task_can_complete(&success,true));
     }
 }

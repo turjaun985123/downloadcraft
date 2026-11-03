@@ -50,7 +50,7 @@ pub fn is_startup_launch(args: &[String]) -> bool {
 #[cfg(windows)]
 fn reg(args: &[&str]) -> Option<std::process::Output> {
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("reg")
+    crate::platform::silent_command("reg")
         .args(args)
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output()

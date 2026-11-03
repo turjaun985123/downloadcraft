@@ -1,8 +1,6 @@
 //! Portable alternative to Windows' off-screen tray parking. The normal
 //! taskbar/Dock window remains the primary surface on Linux and macOS.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-static CONTEXT: Mutex<Option<egui::Context>> = Mutex::new(None);
 static SHOW: AtomicBool = AtomicBool::new(false);
 static QUIT: AtomicBool = AtomicBool::new(false);
 static QUITTING: AtomicBool = AtomicBool::new(false);
@@ -10,14 +8,9 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 fn show_file() -> Option<std::path::PathBuf> {
     crate::model::config_dir().map(|d| d.join("show.request"))
 }
-pub fn set_context(ctx: &egui::Context) {
-    if let Ok(mut c) = CONTEXT.lock() {
-        *c = Some(ctx.clone());
-    }
-}
-fn context() -> Option<egui::Context> {
-    CONTEXT.lock().ok().and_then(|c| c.clone())
-}
+/// Kept generic for compatibility with the legacy frontend's call site. The
+/// GPUI frontend owns repaint and activation through its `WindowHandle`.
+pub fn set_context<T>(_: &T) {}
 pub fn claim_main_instance() -> Option<std::fs::File> {
     match crate::model::claim_window("main") {
         Some(f) => {
@@ -53,11 +46,9 @@ pub fn take_quit() -> bool {
     QUIT.swap(false, Ordering::SeqCst)
 }
 pub fn frame_tick() {}
-pub fn nudge_paint() {
-    if let Some(c) = context() {
-        c.request_repaint();
-    }
-}
+/// GPUI polls show/quit requests from its app task, so there is no renderer
+/// context for this portable compatibility hook to nudge.
+pub fn nudge_paint() {}
 pub fn start_keepalive() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -76,17 +67,17 @@ pub fn start_keepalive() {
     });
 }
 pub fn park() {
-    if let Some(c) = context() {
-        c.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-    }
+    // Portable GPUI builds use the ordinary taskbar/Dock window and do not
+    // claim that a window is parked when there is no system tray icon.
+}
+/// Portable builds use the taskbar/Dock window instead of a tray icon, so a
+/// normal close should close the application rather than leave a hidden
+/// process with no way to restore it.
+pub fn close_main_window() -> bool {
+    true
 }
 pub fn show() {
-    if let Some(c) = context() {
-        c.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        c.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        c.send_viewport_cmd(egui::ViewportCommand::Focus);
-        c.request_repaint();
-    }
+    // The GPUI app consumes `take_show_request()` and activates its window.
 }
 // Portable windows are never parked off screen. Called every frame.
 pub fn restore() {}

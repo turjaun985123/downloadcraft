@@ -102,6 +102,68 @@ fn read_snap(id: u64) -> Snap {
     out
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct GpuiProgressSnapshot {
+    pub item: Option<DownloadItem>,
+    pub live: bool,
+    pub phase: String,
+    pub resolution: String,
+    pub resumable: bool,
+    pub parts: Vec<(u64, u64, u64)>,
+    pub fragments: Option<(u64, u64)>,
+    pub log_lines: Vec<String>,
+}
+
+/// Read the same queue/progress/log files as the legacy progress window and
+/// combine them into a UI-safe snapshot. Transfer ownership remains in the
+/// main application and engine.
+pub(crate) fn gpui_snapshot(id: u64, include_log: bool) -> GpuiProgressSnapshot {
+    let mut item = read_queue().into_iter().find(|item| item.id == id);
+    let snap = read_snap(id);
+    if snap.live {
+        if let Some(item) = item.as_mut() {
+            if let Some(total) = snap.total.filter(|total| *total > 0) {
+                item.total_bytes = Some(total);
+            }
+            item.downloaded_bytes = item.downloaded_bytes.max(snap.downloaded);
+            if let Some(total) = item.total_bytes {
+                item.downloaded_bytes = item.downloaded_bytes.min(total);
+            }
+            item.speed_bps = snap.speed;
+        }
+    }
+    let log_lines = if include_log {
+        crate::engine::job_log_path(&id.to_string())
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|text| text.lines().rev().take(13).map(str::to_string).collect::<Vec<_>>().into_iter().rev().collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    GpuiProgressSnapshot {
+        item,
+        live: snap.live,
+        phase: snap.phase,
+        resolution: snap.resolution,
+        resumable: snap.resumable,
+        parts: snap.parts,
+        fragments: snap.fragments,
+        log_lines,
+    }
+}
+
+pub(crate) fn gpui_command(id: u64, action: &str) {
+    send_cmd(id, action);
+}
+
+pub(crate) fn gpui_set_speed_limit(kbps: u64) {
+    send_cmd_kv("limit", "kbps", serde_json::Value::from(kbps));
+}
+
+pub(crate) fn gpui_set_finish_action(action: &str) {
+    send_cmd_kv("finish", "value", serde_json::Value::String(action.to_string()));
+}
+
 fn read_ui_prefs() -> (String, String) {
     let v: serde_json::Value = config_dir()
         .and_then(|p| std::fs::read_to_string(p.join("ui.json")).ok())
@@ -118,6 +180,11 @@ fn read_ui_prefs() -> (String, String) {
         .unwrap_or("nothing")
         .to_string();
     (lim, fin)
+}
+
+pub(crate) fn gpui_settings() -> (u64, String) {
+    let (limit, finish) = read_ui_prefs();
+    (limit.parse().unwrap_or(0), finish)
 }
 
 /// Command with a payload (`limit` kbps, `finish` action).
@@ -176,15 +243,15 @@ fn send_cmd(id: u64, action: &str) {
 fn open_path(p: &std::path::Path) {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer").arg(p).spawn();
+        let _ = crate::platform::silent_command("explorer").arg(p).spawn();
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(p).spawn();
+        let _ = crate::platform::silent_command("open").arg(p).spawn();
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
-        let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+        let _ = crate::platform::silent_command("xdg-open").arg(p).spawn();
     }
 }
 

@@ -224,6 +224,80 @@ fn read_batch(path: &std::path::Path) -> Result<LinksBatch, String> {
     serde_json::from_str(&data).map_err(|e| e.to_string())
 }
 
+/// Link picker data exposed to the GPUI companion window. Cookie data stays
+/// in this module so the UI cannot accidentally attach it to another host.
+#[cfg(feature = "gpui-ui")]
+#[derive(Clone)]
+pub struct GpuiLinkRow {
+    pub url: String,
+    pub text: String,
+    pub name: String,
+    pub checked: bool,
+}
+
+#[cfg(feature = "gpui-ui")]
+pub struct GpuiLinksBatch {
+    pub page_url: String,
+    pub title: String,
+    cookie: String,
+    pub rows: Vec<GpuiLinkRow>,
+}
+
+#[cfg(feature = "gpui-ui")]
+pub fn gpui_load(path: &std::path::Path) -> Result<GpuiLinksBatch, String> {
+    let batch = read_batch(path)?;
+    let rows = batch.links.into_iter().map(|link| {
+        let mut name = engine::sanitize_filename(&filename_from_url(&link.url));
+        if crate::model::is_fallback_filename(&name) {
+            name = page_name(&link.url, &link.text);
+        }
+        let (_, html, image) = type_of(&name, None);
+        let checked = !matches!(Kind::of(&name, html, image), Kind::Page | Kind::Other | Kind::Image);
+        GpuiLinkRow { url: link.url, text: link.text, name, checked }
+    }).collect();
+    Ok(GpuiLinksBatch { page_url: batch.page_url, title: batch.title, cookie: batch.cookie, rows })
+}
+
+#[cfg(feature = "gpui-ui")]
+pub fn gpui_commit(batch: &GpuiLinksBatch, selected: &[usize], start: bool) -> String {
+    if selected.is_empty() { return "Check links to download first.".into(); }
+    let prefs = crate::capture_service::load_prefs();
+    let mut added = Vec::new();
+    let mut already = 0usize;
+    let mut failed = None;
+    for &index in selected {
+        let Some(row) = batch.rows.get(index) else { continue };
+        let name = crate::model::apply_rename_template(
+            &prefs.rename_template,
+            &engine::sanitize_filename(row.name.trim()),
+            &row.url,
+        );
+        let mut folder = std::path::PathBuf::from(&prefs.save_dir);
+        match prefs.folder_rules.iter().find(|rule| rule.matches(&name)) {
+            Some(rule) if !rule.folder.trim().is_empty() => folder.push(rule.folder.trim()),
+            _ => folder.push(category_of(&name)),
+        }
+        let mut item = DownloadItem::new(0, row.url.clone(), engine::sanitize_filename(&name), folder.to_string_lossy().into_owned(), prefs.connections);
+        item.referer = batch.page_url.clone();
+        if same_host(&row.url, &batch.page_url) { item.cookie = batch.cookie.clone(); }
+        item.description = row.text.clone();
+        match crate::model::append_to_queue(&mut item) {
+            crate::model::AppendResult::Added(id) => added.push(id),
+            crate::model::AppendResult::AlreadyQueued(_) => already += 1,
+            crate::model::AppendResult::Error(error) => failed = Some(error),
+        }
+    }
+    if !added.is_empty() {
+        if start {
+            crate::capture_service::wake_ids(&added);
+        }
+        crate::capture_service::gpui_wake_main_app();
+    }
+    if let Some(error) = failed { return format!("Queued {}; queue update failed: {error}", added.len()); }
+    if added.is_empty() { return format!("All {already} selected link(s) are already queued."); }
+    format!("Queued {} link(s).", added.len())
+}
+
 /// Sortable columns.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortBy {
@@ -251,7 +325,7 @@ struct LinksApp {
     /// false = all into `one_dir`.
     by_category: bool,
     one_dir: String,
-    prefs: crate::confirm::UiPrefs,
+    prefs: crate::capture_service::UiPrefs,
     /// Widths of the sized columns (see `COLS`), dragged by their dividers.
     cols: [f32; 3],
     probe_rx: Option<Receiver<(usize, Option<u64>, Option<String>, Option<String>)>>,
@@ -324,7 +398,11 @@ impl LinksApp {
             referer: self.page_url.clone(),
             ..Default::default()
         };
-        let with_cookie = EngineOpts { cookie: self.cookie.clone(), ..base.clone() };
+        let with_cookie = EngineOpts {
+            cookie: self.cookie.clone(),
+            cookie_scope: crate::engine::CredentialScope::for_url(&self.page_url),
+            ..base.clone()
+        };
         let page = self.page_url.clone();
         self._rt.spawn(async move {
             use futures_util::StreamExt;
@@ -429,7 +507,7 @@ impl LinksApp {
             }
         }
         if start && !added.is_empty() {
-            crate::confirm::wake_ids(&added);
+            crate::capture_service::wake_ids(&added);
         }
         if let Some(e) = failed {
             self.notice = format!("Queued {}; could not update the queue: {e}", added.len());
@@ -1067,7 +1145,7 @@ pub fn run() -> eframe::Result<()> {
             std::process::exit(2);
         }
     };
-    let prefs = crate::confirm::load_prefs();
+    let prefs = crate::capture_service::load_prefs();
     let rows = batch
         .links
         .into_iter()
