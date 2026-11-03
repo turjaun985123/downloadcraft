@@ -15,6 +15,12 @@ strip = true
 [workspace]
 members = [".", "crates/downloadcraft-engine"]
 
+# GPUI 0.2.2 resolves xattr 0.2.3, which refers to libc::ENOATTR on Linux.
+# Linux calls the same missing-attribute condition ENODATA; keep the upstream
+# crate otherwise unchanged until GPUI updates its dependency chain.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
+
 [features]
 default = ["gpui-ui"]
 # Native Rust desktop frontend.
