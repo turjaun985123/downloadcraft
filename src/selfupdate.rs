@@ -715,10 +715,10 @@ mod tests {
         let h = "a".repeat(64);
         let v = serde_json::json!({ "assets": [
             { "name": "DownloadCraft-1.0-x86_64.AppImage", "browser_download_url": "https://x/a", "size": 1 },
-            { "name": "DownloadCraft-1.0-windows-x64-portable.zip", "browser_download_url": "https://x/p.zip", "size": 42, "digest": format!("sha256:{h}") },
+            { "name": "DownloadCraft-1.0-windows-x64-portable.zip", "browser_download_url": "https://github.com/download-craft/releases/download/v1.0/p.zip", "size": 42, "digest": format!("sha256:{h}") },
         ]});
         let a = pick_asset(&v).unwrap();
-        assert_eq!((a.url.as_str(), a.size, a.sha256.as_deref()), ("https://x/p.zip", 42, Some(h.as_str())));
+        assert_eq!((a.url.as_str(), a.size, a.sha256.as_deref()), ("https://github.com/download-craft/releases/download/v1.0/p.zip", 42, Some(h.as_str())));
     }
 
     #[test]

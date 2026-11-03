@@ -10293,7 +10293,9 @@ mod tests {
             ..EngineOpts::default()
         };
         let client = opts.build_client().unwrap();
-        let same = opts.get(&client, "https://seg.example.com/s0.ts").build().unwrap();
+        // Captured credentials follow the exact captured host; a sibling host
+        // may share its site but must not inherit authorization headers.
+        let same = opts.get(&client, "https://media.example.com/s0.ts").build().unwrap();
         assert_eq!(same.headers().get("authorization").unwrap(), "Bearer t");
         assert_eq!(same.headers().get("x-token").unwrap(), "1");
         assert!(same.headers().get("range").is_none());

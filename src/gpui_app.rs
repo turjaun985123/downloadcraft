@@ -87,7 +87,7 @@ impl QueueFilter {
     }
 }
 
-struct DownloadManagerStore {
+pub(crate) struct DownloadManagerStore {
     runtime: tokio::runtime::Handle,
     updates: crate::update_service::UpdateService,
     speed_limit_live: Arc<std::sync::atomic::AtomicU64>,

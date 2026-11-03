@@ -1,4 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// The binary test harness replaces `main`, so app-only helpers look unused
+// even though the production entry point calls them. Production builds keep
+// the normal dead-code lint enabled.
+#![cfg_attr(test, allow(dead_code))]
 //! Download Craft: GUI + CLI + native host + standalone dialogs.
 //! Release builds run without a console window; all diagnostics go to
 //! %APPDATA%/download_craft/crash.log and the in-app log/queues panels.
