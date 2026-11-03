@@ -94,3 +94,9 @@ it("recognises MP4 bytes", () => {
   assert.ok(M.isMp4(read("v_frag.mp4")));
   assert.ok(!M.isMp4(new TextEncoder().encode("#EXTM3U\n#EXT-X-VERSION:3\n")));
 });
+
+it("rejects malformed and truncated MP4 atom boundaries", () => {
+  assert.throws(() => M.parse(Uint8Array.of(0, 0, 0, 5, 0x66, 0x74, 0x79, 0x70)), /bad ftyp box/);
+  assert.throws(() => M.parse(Uint8Array.of(0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70, 0)), /truncated box header/);
+  assert.throws(() => M.parse(Uint8Array.of(0, 0, 0, 1, 0x66, 0x74, 0x79, 0x70)), /truncated extended/);
+});
