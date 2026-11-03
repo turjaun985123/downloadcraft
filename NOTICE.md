@@ -44,8 +44,12 @@ adapted, or embedded.
 
 ## Rust crates
 
+- `gpui` (© Zed Industries) — Apache-2.0, used for the native desktop UI.
 - `sha2` (© RustCrypto contributors) — MIT / Apache-2.0, used for optional
   SHA-256 file-integrity verification.
-- `egui_extras` (© egui contributors) — MIT / Apache-2.0, used for the
-  download table (`TableBuilder`: aligned headers/rows, resizable columns,
-  full-row selection).
+- `stacksafe-macro` (© StackSafe contributors) — Apache-2.0. The vendored
+  compatibility patch removes an unmaintained diagnostics dependency while
+  preserving the upstream macro transformation; its license is in
+  `vendor/stacksafe-macro/LICENSE-APACHE`.
+- `xattr` (© xattr contributors) — MIT / Apache-2.0. The vendored Linux
+  compatibility patch is in `vendor/xattr/` with both license texts.

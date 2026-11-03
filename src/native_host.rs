@@ -1054,7 +1054,14 @@ fn page_fetch_chunk(msg: &Incoming) -> Result<(), String> {
 /// name gave "_home_me_Downloads_x.zip" (issue #6).
 fn file_part(name: &str) -> Option<String> {
     let last = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
-    (!last.is_empty()).then(|| last.to_string())
+    if last.is_empty()
+        || matches!(last, "." | "..")
+        || last.contains(':') // Includes Windows alternate data stream syntax.
+        || last.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(last.to_string())
 }
 
 fn preferred_referer(page_url: Option<&str>, referer: Option<&str>) -> Option<String> {
@@ -1509,6 +1516,10 @@ mod media_tests {
         assert_eq!(file_part(r"C:\Users\me\Downloads\b.exe").as_deref(), Some("b.exe"));
         assert_eq!(file_part("plain.txt").as_deref(), Some("plain.txt"));
         assert_eq!(file_part("/home/me/"), None);
+        assert_eq!(file_part("../../safe.txt").as_deref(), Some("safe.txt"));
+        assert_eq!(file_part("file.txt:stream"), None);
+        assert_eq!(file_part("bad\0name.txt"), None);
+        assert_eq!(file_part("bad\u{0007}name.txt"), None);
     }
 
     #[test]
