@@ -65,14 +65,14 @@ Productivity (Chrome / Edge / Opera); Download Management (Firefox).
 - The `key` in `manifest.json` fixes the extension ID that the app's native host allows (`allowed_origins`). The Web Store keeps an uploaded item's ID only if the same key is used. Once the item exists, check that its ID matches `EXTENSION_ID` in the app.
 
 ### Microsoft Edge Add-ons
-- Same ZIP. Edge gives the item its own ID: add that ID to `STORE_EXTENSION_IDS` in `src/app.rs` (the native host then allows it) and ship that app build before the listing goes live.
+- Same ZIP. Edge gives the item its own ID: add that ID to `STORE_EXTENSION_IDS` in `src/integration.rs` (the native host then allows it) and ship that app build before the listing goes live.
 
 ### Opera Add-ons
 - Same ZIP. Opera reads the native host from Chrome's registry key, which the app registers at every start, so no extra install step is needed. Opera also assigns its own ID: add it to `STORE_EXTENSION_IDS` as for Edge.
 - Opera users can also install the Chrome Web Store version through "Install Chrome Extensions".
 
 ### Firefox (AMO)
-- Build with `build-firefox.ps1` and upload the result. The add-on ID comes from `manifest-firefox.json` (`browser_specific_settings.gecko.id`) and must match `allowed_extensions` in the Firefox host manifest (`install_native_host` in `src/app.rs`). It is `send-to-download-craft@example` today. Change both to an address you own (for example `send-to-download-craft@<your domain>`) before the first upload, because AMO fixes the ID for good.
+- Build with `build-firefox.ps1` and upload the result. The add-on ID comes from `manifest-firefox.json` (`browser_specific_settings.gecko.id`) and must match `allowed_extensions` in the Firefox host manifest (`install_native_host` in `src/integration.rs`). It is `send-to-download-craft@example` today. Change both to an address you own (for example `send-to-download-craft@<your domain>`) before the first upload, because AMO fixes the ID for good.
 - AMO asks for the source of minified code. None of the code is minified, so upload as is.
 
 ## Review notes (for the reviewer field)

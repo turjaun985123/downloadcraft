@@ -1,6 +1,6 @@
 //! Browser native-messaging host installation and status.
 //!
-//! This module is deliberately independent of the egui UI so GPUI, CLI, and
+//! This module is deliberately independent of the GPUI UI so the desktop app, CLI, and
 //! setup flows can share the browser integration.
 
 pub(crate) const EXTENSION_ID: &str = "pgdhmfgefjnfijmlheboncdmfhcnoikk";

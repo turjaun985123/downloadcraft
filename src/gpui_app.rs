@@ -751,7 +751,7 @@ impl DownloadManagerStore {
         let Ok(data) = std::fs::read_to_string(&path) else {
             return;
         };
-        // Claim before applying, matching the existing eframe command loop's
+        // Claim before applying, matching the previous desktop command loop's
         // at-most-once behavior across the two frontends.
         let _ = std::fs::remove_file(&path);
         let Ok(commands) = serde_json::from_str::<Vec<serde_json::Value>>(&data) else {

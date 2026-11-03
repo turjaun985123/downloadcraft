@@ -11,8 +11,8 @@ Updated 1 Nov 2026, for 0.9.13.
 
 | | Item | Notes |
 |---|---|---|
-| 🔴 | Firefox add-on ID | `browser-extension/manifest-firefox.json` and the Firefox host manifest in `src/app.rs` use `send-to-download-craft@example`. Change both to an address you own before the first AMO upload: AMO fixes the ID for good. |
-| 🟠 | Store IDs for Edge and Opera | Once the extension is listed there, add the IDs those stores assign to `STORE_EXTENSION_IDS` in `src/app.rs` (see `docs/STORE_LISTING.md`). |
+| 🔴 | Firefox add-on ID | `browser-extension/manifest-firefox.json` and the Firefox host manifest in `src/integration.rs` use `send-to-download-craft@example`. Change both to an address you own before the first AMO upload: AMO fixes the ID for good. |
+| 🟠 | Store IDs for Edge and Opera | Once the extension is listed there, add the IDs those stores assign to `STORE_EXTENSION_IDS` in `src/integration.rs` (see `docs/STORE_LISTING.md`). |
 
 ## Not tested against the real thing yet
 
