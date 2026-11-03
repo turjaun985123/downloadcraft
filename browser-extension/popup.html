@@ -8,6 +8,9 @@
   --ok:#22c55e; --bad:#ef4444; --warn:#f59e0b; --thumb:linear-gradient(135deg,#667eea,#764ba2);
 }
 * { box-sizing:border-box; }
+button:focus-visible, input:focus-visible, select:focus-visible, .ghead:focus-visible {
+  outline:2px solid var(--accent); outline-offset:2px;
+}
 body { width:430px; margin:0; background:var(--bg); color:var(--text);
   font:13px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif; }
 button, input, select { font:inherit; color:inherit; }
@@ -41,7 +44,8 @@ button, input, select { font:inherit; color:inherit; }
 html, body { overflow:hidden; }
 .view[hidden] { display:none; }
 .group { margin-bottom:6px; }
-.ghead { display:flex; align-items:center; gap:6px; padding:8px 2px 6px; cursor:pointer; user-select:none; }
+.ghead { all:unset; box-sizing:border-box; width:100%; display:flex; align-items:center; gap:6px; padding:8px 2px 6px; cursor:pointer; user-select:none; }
+.ghead:hover { color:var(--text); }
 .ghead b { font-size:12px; }
 .ghead .n { color:var(--muted); font-weight:600; font-size:11px; }
 .ghead .sub { color:var(--muted); font-size:11px; flex:1; }
@@ -113,6 +117,7 @@ input[type=text] { flex:1; min-width:0; height:32px; padding:0 9px; background:v
 .sw i::after { content:""; position:absolute; left:2px; top:2px; width:15px; height:15px; border-radius:50%; background:#fff; transition:left .15s; }
 .sw input:checked + i { background:var(--accent); }
 .sw input:checked + i::after { left:17px; }
+.sw input:focus-visible + i { outline:2px solid var(--accent); outline-offset:3px; }
 .sw input:disabled + i { opacity:.45; cursor:default; }
 .opt input[type=text] { display:block; width:100%; }
 label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
@@ -125,46 +130,46 @@ label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
   <div class="brand">Download Craft</div>
   <div class="conn" id="conn" data-i18n="popChecking">Checking…</div>
 </div>
-<div class="tabs">
-  <button class="tab on" id="tabVideos" data-i18n="popVideos">Videos<span class="n" id="count"></span></button>
-  <button class="tab" id="tabDownloads" data-i18n="popDownloads">Downloads<span class="n" id="dlCount"></span></button>
-  <button class="tab" id="tabSettings" data-i18n="popSettings">Settings</button>
+<div class="tabs" role="tablist" aria-label="Download Craft views">
+  <button type="button" class="tab on" id="tabVideos" role="tab" aria-controls="viewVideos" aria-selected="true" data-i18n="popVideos">Videos<span class="n" id="count"></span></button>
+  <button type="button" class="tab" id="tabDownloads" role="tab" aria-controls="viewDownloads" aria-selected="false" data-i18n="popDownloads">Downloads<span class="n" id="dlCount"></span></button>
+  <button type="button" class="tab" id="tabSettings" role="tab" aria-controls="viewSettings" aria-selected="false" data-i18n="popSettings">Settings</button>
 </div>
 
-<div id="viewVideos">
+<div id="viewVideos" role="tabpanel" aria-labelledby="tabVideos" tabindex="0">
   <div class="tools">
-    <button class="ib" id="filterBtn" title="Show: all, videos, streams or other files"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M4 7h16M7 12h10M10 17h4"/></svg></button>
-    <label class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="q" name="q" placeholder="Filter by title"></label>
-    <button class="ib" id="autoBtn" title="Send the browser's downloads to the app automatically"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg></button>
-    <button class="ib" id="detectBtn" title="Video detection on/off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0"/></svg></button>
-    <button class="ib" id="pauseBtn" title="Pause all downloads in the app"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></button>
-    <button class="ib" id="refreshBtn" title="Look for videos on this page again"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
-    <button class="ib" id="clearBtn" title="Clear what was found on this page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>
+    <button type="button" class="ib" id="filterBtn" title="Show: all, videos, streams or other files" aria-label="Filter detected files" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M4 7h16M7 12h10M10 17h4"/></svg></button>
+    <label class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="q" name="q" aria-label="Filter detected files by title" placeholder="Filter by title"></label>
+    <button type="button" class="ib" id="autoBtn" title="Send the browser's downloads to the app automatically" aria-label="Toggle automatic browser download capture" aria-pressed="false"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg></button>
+    <button type="button" class="ib" id="detectBtn" title="Video detection on/off" aria-label="Toggle video detection" aria-pressed="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0"/></svg></button>
+    <button type="button" class="ib" id="pauseBtn" title="Pause all downloads in the app" aria-label="Pause all downloads"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></button>
+    <button type="button" class="ib" id="refreshBtn" title="Look for videos on this page again" aria-label="Rescan this page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
+    <button type="button" class="ib" id="clearBtn" title="Clear what was found on this page" aria-label="Clear detected files from this page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>
   </div>
   <div class="view" id="videosView">
     <div id="videos"></div>
     <div class="manual">
-      <input type="text" id="url" placeholder="Paste a link to download…">
-      <button class="btn primary" id="send" data-i18n="popSend">Send</button>
+      <input type="text" id="url" aria-label="Download URL" placeholder="Paste a link to download…">
+      <button type="button" class="btn primary" id="send" data-i18n="popSend">Send</button>
     </div>
   </div>
 </div>
 
-<div class="view" id="viewDownloads" hidden>
+<div class="view" id="viewDownloads" role="tabpanel" aria-labelledby="tabDownloads" tabindex="0" hidden>
   <div id="downloads"></div>
 </div>
 
-<div class="view" id="viewSettings" hidden>
-  <div class="opt"><div class="txt"><b data-i18n="popCapture">Capture browser downloads</b><span data-i18n="popCaptureHint">Hand every download to Download Craft.</span></div>
-    <label class="sw"><input type="checkbox" id="auto"><i></i></label></div>
-  <div class="opt"><div class="txt"><b data-i18n="popVideoDetection">Video detection</b><span data-i18n="popVideoHint">Find videos on pages and show the download bar on players.</span></div>
-    <label class="sw"><input type="checkbox" id="detect"><i></i></label></div>
+<div class="view" id="viewSettings" role="tabpanel" aria-labelledby="tabSettings" tabindex="0" hidden>
+  <div class="opt"><div class="txt"><b id="autoLabel" data-i18n="popCapture">Capture browser downloads</b><span id="autoHint" data-i18n="popCaptureHint">Hand every download to Download Craft.</span></div>
+    <label class="sw"><input type="checkbox" id="auto" aria-labelledby="autoLabel" aria-describedby="autoHint"><i></i></label></div>
+  <div class="opt"><div class="txt"><b id="detectLabel" data-i18n="popVideoDetection">Video detection</b><span id="detectHint" data-i18n="popVideoHint">Find videos on pages and show the download bar on players.</span></div>
+    <label class="sw"><input type="checkbox" id="detect" aria-labelledby="detectLabel" aria-describedby="detectHint"><i></i></label></div>
   <div class="opt"><div class="txt"><b data-i18n="popDeep">Deep video detection</b><span data-i18n="popDeepHint">Reads the first 4 KB of unlabeled responses to find hidden streams.</span></div>
-    <label class="sw"><input type="checkbox" id="deep"><i></i></label></div>
+    <label class="sw"><input type="checkbox" id="deep" aria-label="Deep video detection"><i></i></label></div>
   <div class="opt"><div class="txt"><b data-i18n="popOneClick">One-click download in my last quality</b><span data-i18n="popOneClickHint">The video button downloads the quality you picked last; its ▾ opens the menu.</span></div>
-    <label class="sw"><input type="checkbox" id="oneClick"><i></i></label></div>
+    <label class="sw"><input type="checkbox" id="oneClick" aria-label="One-click download using the last selected quality"><i></i></label></div>
   <div class="opt"><div class="txt"><b data-i18n="popHideBubble">Hide browser download bubble</b><span data-i18n="popBubbleHint">While capture is on and the app is connected.</span></div>
-    <label class="sw"><input type="checkbox" id="hideUI"><i></i></label></div>
+    <label class="sw"><input type="checkbox" id="hideUI" aria-label="Hide browser download bubble"><i></i></label></div>
   <div class="opt" style="display:block">
     <label class="fl" for="minSize" data-i18n="popMinSize">Ignore files smaller than (KB)</label>
     <input type="text" id="minSize" placeholder="100">
@@ -174,7 +179,7 @@ label.fl { display:block; color:var(--dim); font-size:11px; margin:2px 0 4px; }
   </div>
   <div class="row"><button class="btn" id="restoreVideoButtons" data-i18n="popRestoreButtons">Show hidden video buttons again</button></div>
 </div>
-<div id="status"></div>
+<div id="status" role="status" aria-live="polite" aria-atomic="true"></div>
 <script src="rank.js"></script>
 <script src="popup.js"></script>
 </body>

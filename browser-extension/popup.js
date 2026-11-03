@@ -89,7 +89,11 @@ async function saveHidden() {
 let pollTimer = 0;
 function showTab(which) {
   for (const [t, v] of [["Videos", "viewVideos"], ["Downloads", "viewDownloads"], ["Settings", "viewSettings"]]) {
-    $("tab" + t).classList.toggle("on", which === t.toLowerCase());
+    const tab = $("tab" + t);
+    const selected = which === t.toLowerCase();
+    tab.classList.toggle("on", selected);
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
     $(v).hidden = which !== t.toLowerCase();
   }
   clearInterval(pollTimer);
@@ -103,12 +107,24 @@ function showTab(which) {
 $("tabVideos").onclick = () => showTab("videos");
 $("tabDownloads").onclick = () => showTab("downloads");
 $("tabSettings").onclick = () => showTab("settings");
+document.querySelector(".tabs").addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const tabs = [...document.querySelectorAll("[role=tab]")];
+  const current = tabs.indexOf(document.activeElement);
+  const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+    : (current + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length;
+  tabs[next].focus();
+  tabs[next].click();
+});
 
 // ---------- settings + toolbar state ----------
 function setToolState(auto, detect) {
   $("autoBtn").classList.toggle("on", !!auto);
+  $("autoBtn").setAttribute("aria-pressed", String(!!auto));
   $("autoBtn").title = auto ? "Browser downloads go to the app automatically (on)" : "Send the browser's downloads to the app automatically (off)";
   $("detectBtn").classList.toggle("off", detect === false);
+  $("detectBtn").setAttribute("aria-pressed", String(detect !== false));
   $("detectBtn").title = detect === false ? "Video detection is off — click to turn it on" : "Video detection is on — click to turn it off";
 }
 chrome.runtime.sendMessage({ type: "getState" }, (res) => {
@@ -182,17 +198,19 @@ $("pauseBtn").onclick = () => {
 };
 
 // ---------- sending ----------
-function send(msg) {
+function send(msg, onComplete) {
   chrome.runtime.sendMessage(msg, (res) => {
     if (chrome.runtime.lastError || !res) status("App not reachable — open Download Craft, or use Download in browser.", "bad");
     else status(res.ok ? "Sent to Download Craft ✓" : ("Not sent. " + (res.error || "")), res.ok ? "ok" : "bad");
+    if (onComplete) onComplete();
   });
 }
-function sendBrowser(job) {
+function sendBrowser(job, onComplete) {
   chrome.runtime.sendMessage({ type: "browserDownload", ...job }, (res) => {
     if (chrome.runtime.lastError || !res) status("Extension background unreachable.", "bad");
     else if (res.ok) { status("Downloading in the browser — see the Downloads tab", "ok"); updateDlCount(); }
     else status("Could not start: " + (res.error || "unknown error"), "bad");
+    if (onComplete) onComplete();
   });
 }
 $("send").onclick = () => {
@@ -242,7 +260,44 @@ const SVG = {
 };
 
 let openMenu = null;
-document.addEventListener("click", () => { if (openMenu) { openMenu.remove(); openMenu = null; } });
+let openMenuButton = null;
+function closePopupMenu(restoreFocus = false) {
+  const trigger = openMenuButton;
+  if (openMenu) openMenu.remove();
+  openMenu = null;
+  openMenuButton = null;
+  if (trigger) {
+    trigger.setAttribute("aria-expanded", "false");
+    if (restoreFocus) trigger.focus();
+  }
+}
+function wirePopupMenu(menu, trigger, radio = false) {
+  closePopupMenu(false);
+  menu.setAttribute("role", "menu");
+  menu.tabIndex = -1;
+  for (const button of menu.querySelectorAll("button")) {
+    button.setAttribute("role", radio ? "menuitemradio" : "menuitem");
+    button.tabIndex = 0;
+  }
+  openMenu = menu;
+  openMenuButton = trigger;
+  trigger.setAttribute("aria-expanded", "true");
+  menu.addEventListener("keydown", (event) => {
+    const buttons = [...menu.querySelectorAll("button:not(:disabled)")];
+    if (event.key === "Escape") {
+      event.preventDefault(); event.stopPropagation(); closePopupMenu(true); return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || !buttons.length) return;
+    event.preventDefault();
+    const current = buttons.indexOf(document.activeElement);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1
+      : (current + (event.key === "ArrowDown" ? 1 : buttons.length - 1)) % buttons.length;
+    buttons[next].focus();
+  });
+  const first = menu.querySelector("button:not(:disabled)");
+  if (first) first.focus();
+}
+document.addEventListener("click", () => closePopupMenu(false));
 
 // item: { title, thumb, dur, tag, link, page, kind, options: [opt] }
 // opt: { label, size, approx, url, pairUrl, msg (to the app), browser (job) }
@@ -289,6 +344,7 @@ function card(item, mode) {
   const row = document.createElement("div");
   row.className = "row";
   const sel = document.createElement("select");
+  sel.setAttribute("aria-label", `Quality for ${item.title || "video"}`);
   options.forEach((o, i) => {
     const op = document.createElement("option");
     op.value = String(i);
@@ -315,11 +371,13 @@ function card(item, mode) {
   dl.title = inBrowser ? "Download in this browser — no app needed"
     : viaApp ? "YouTube only lets the app download it — hands this quality to Download Craft"
     : "Download with Download Craft";
+  dl.setAttribute("aria-label", dl.title);
   // DRM files are listed (so it is clear why) but never downloaded: their
   // bytes are encrypted and a saved copy has no picture or sound.
   const drmBlock = () => {
     const o = options[Number(sel.value)] || {};
     dl.disabled = !!o.drm;
+    dl.setAttribute("aria-disabled", String(!!o.drm));
     dl.style.opacity = o.drm ? ".45" : "";
     dl.style.cursor = o.drm ? "not-allowed" : "";
     if (o.drm) dl.title = "DRM-protected — this video can't be downloaded (a saved copy would have no picture or sound)";
@@ -328,27 +386,35 @@ function card(item, mode) {
   sel.addEventListener("change", drmBlock);
   dl.onclick = () => {
     const o = options[Number(sel.value)];
-    if (!o || o.drm) return;
-    if (inBrowser) sendBrowser({ ...o.browser, title: item.title, pageUrl: item.page });
-    else send(o.msg);
+    if (!o || o.drm || dl.disabled) return;
+    dl.disabled = true;
+    dl.setAttribute("aria-busy", "true");
+    const done = () => { dl.disabled = false; dl.removeAttribute("aria-busy"); };
+    if (inBrowser) sendBrowser({ ...o.browser, title: item.title, pageUrl: item.page }, done);
+    else send(o.msg, done);
   };
   const more = document.createElement("button");
   more.className = "more"; more.innerHTML = SVG.dots; more.title = "More";
+  more.type = "button";
+  more.setAttribute("aria-label", `More actions for ${item.title || "video"}`);
+  more.setAttribute("aria-haspopup", "menu");
+  more.setAttribute("aria-expanded", "false");
   more.onclick = (ev) => {
     ev.stopPropagation();
-    if (openMenu) { openMenu.remove(); openMenu = null; return; }
+    if (openMenu && openMenuButton === more) { closePopupMenu(false); return; }
+    closePopupMenu(false);
     const o = options[Number(sel.value)] || {};
     const link = o.url || item.link;
     const m = document.createElement("div");
     m.className = "menu";
-    const add = (label, fn) => { const b = document.createElement("button"); b.textContent = label; b.onclick = (e) => { e.stopPropagation(); fn(); m.remove(); openMenu = null; }; m.appendChild(b); };
+    const add = (label, fn) => { const b = document.createElement("button"); b.type = "button"; b.textContent = label; b.onclick = (e) => { e.stopPropagation(); fn(); closePopupMenu(false); }; m.appendChild(b); };
     if (link) add("Copy link", async () => { try { await navigator.clipboard.writeText(link); status("Link copied", "ok"); } catch (e) { status("Could not copy", "bad"); } });
     if (link) add("Open link in new tab", () => api.tabs.create({ url: link }));
     if (mode === "app" && o.browser) add("Download in browser instead", () => sendBrowser({ ...o.browser, title: item.title, pageUrl: item.page }));
     if (inBrowser) add("Send to Download Craft instead", () => send(o.msg));
     if (item.page && mode === "app") add("Send page link instead", () => send({ type: "download", url: item.page, pageUrl: item.page }));
     more.appendChild(m);
-    openMenu = m;
+    wirePopupMenu(m, more);
   };
   row.append(sel, dl, more);
   body.append(title, meta, row);
@@ -545,8 +611,11 @@ function collectItems(peek, pageUrl) {
 function group(id, label, sub, count, cls, build) {
   const g = document.createElement("div");
   g.className = "group" + ((prefs.closed || {})[id] ? " closed" : "");
-  const h = document.createElement("div");
+  const h = document.createElement("button");
+  h.type = "button";
   h.className = "ghead";
+  h.setAttribute("aria-expanded", String(!g.classList.contains("closed")));
+  h.setAttribute("aria-controls", `group-${id}-body`);
   h.innerHTML = `<span class="chev">${SVG.chev}</span><span class="pillsrc ${cls}"></span><b></b><span class="n"></span><span class="sub"></span>`;
   h.querySelector(".pillsrc").textContent = cls === "br" ? "BROWSER" : "APP";
   h.querySelector("b").textContent = label;
@@ -554,11 +623,13 @@ function group(id, label, sub, count, cls, build) {
   h.querySelector(".sub").textContent = sub;
   h.onclick = () => {
     g.classList.toggle("closed");
+    h.setAttribute("aria-expanded", String(!g.classList.contains("closed")));
     prefs.closed = { ...(prefs.closed || {}), [id]: g.classList.contains("closed") };
     savePrefs();
   };
   const b = document.createElement("div");
   b.className = "gbody";
+  b.id = `group-${id}-body`;
   build(b);
   g.append(h, b);
   return g;
@@ -614,27 +685,32 @@ function render(peek, pageUrl) {
 $("q").oninput = () => { if (lastRender) lastRender(); };
 $("filterBtn").onclick = (ev) => {
   ev.stopPropagation();
-  if (openMenu) { openMenu.remove(); openMenu = null; return; }
+  if (openMenu && openMenuButton === $("filterBtn")) { closePopupMenu(false); return; }
+  closePopupMenu(false);
   const m = document.createElement("div");
   m.className = "menu";
   m.style.left = "0"; m.style.right = "auto";
   for (const [k, label] of [["all", "Everything"], ["videos", "Videos"], ["streams", "Streams (HLS / DASH)"], ["other", "Other files"]]) {
     const b = document.createElement("button");
+    b.type = "button";
     b.textContent = label;
+    b.setAttribute("aria-checked", String(k === filterKind));
     if (k === filterKind) b.className = "sel";
     b.onclick = (e) => {
       e.stopPropagation();
       filterKind = k; prefs.filter = k; savePrefs();
       $("filterBtn").classList.toggle("on", k !== "all");
-      m.remove(); openMenu = null;
+      $("filterBtn").setAttribute("aria-pressed", String(k !== "all"));
+      closePopupMenu(false);
       if (lastRender) lastRender();
     };
     m.appendChild(b);
   }
   $("filterBtn").appendChild(m);
-  openMenu = m;
+  wirePopupMenu(m, $("filterBtn"), true);
 };
 $("filterBtn").classList.toggle("on", filterKind !== "all");
+$("filterBtn").setAttribute("aria-pressed", String(filterKind !== "all"));
 
 // Sizes for rows that have none (measured in the browser session) and
 // "✓ Queued" for rows already in the app.
@@ -681,7 +757,8 @@ function jobCard({ src, name, state, chipText, chipCls, frac, indeterminate, lin
   top.append(s, chip);
   for (const [svg, title, fn] of actions || []) {
     const b = document.createElement("button");
-    b.className = "ja"; b.innerHTML = svg; b.title = title; b.onclick = fn;
+    b.type = "button";
+    b.className = "ja"; b.innerHTML = svg; b.title = title; b.setAttribute("aria-label", title); b.onclick = fn;
     top.appendChild(b);
   }
   const n = document.createElement("div"); n.className = "jn"; n.textContent = name; n.title = name;

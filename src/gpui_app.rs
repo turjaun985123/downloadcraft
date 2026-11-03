@@ -1194,13 +1194,15 @@ impl Render for LinksView {
             let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             (state.batch.title.clone(), state.batch.page_url.clone(), state.batch.rows.clone(), state.notice.clone())
         };
-        let mut list = div().id("links-batch-list").flex().flex_col().gap_1().overflow_scroll();
+        let mut list = div().id("links-batch-list").flex_1().min_h_0().flex().flex_col().gap_1().overflow_scroll();
         for (index, row) in rows.iter().enumerate() {
             let selected = row.checked;
             let state = self.state.clone();
             list = list.child(
                 div().id(SharedString::from(format!("link-row-{index}")))
-                    .flex().flex_col().gap_1().p_2().rounded_sm().bg(rgb(card_color()))
+                    .flex().flex_col().gap_1().px_2().py_2().rounded_sm()
+                    .bg(rgb(if selected { button_color() } else { background_color() }))
+                    .border_b_1().border_color(rgb(button_color()))
                     .cursor_pointer()
                     .child(div().text_sm().font_weight(gpui::FontWeight::BOLD)
                         .child(format!("{} {}", if selected { "☑" } else { "☐" }, row.name)))
@@ -1213,6 +1215,13 @@ impl Render for LinksView {
             );
         }
         let selected_count = rows.iter().filter(|row| row.checked).count();
+        if rows.is_empty() {
+            list = list.child(
+                div().flex_1().flex().items_center().justify_center()
+                    .text_sm().text_color(rgb(muted_color()))
+                    .child("No downloadable links were found on this page."),
+            );
+        }
         let state = self.state.clone();
         let select_all = action_button("Select all", "links-select-all", move |window, _| {
             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
@@ -1229,16 +1238,24 @@ impl Render for LinksView {
         let queue = action_button("Add to queue", "links-queue", move |window, _| {
             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
             let selected = state.batch.rows.iter().enumerate().filter_map(|(i, row)| row.checked.then_some(i)).collect::<Vec<_>>();
-            state.notice = crate::links_service::gpui_commit(&state.batch, &selected, false);
+            state.notice = if selected.is_empty() {
+                "Select at least one link first.".into()
+            } else {
+                crate::links_service::gpui_commit(&state.batch, &selected, false)
+            };
             window.refresh();
-        });
+        }).when(selected_count == 0, |button| button.opacity(0.45));
         let state = self.state.clone();
         let download = action_button("Download selected", "links-download", move |window, _| {
             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
             let selected = state.batch.rows.iter().enumerate().filter_map(|(i, row)| row.checked.then_some(i)).collect::<Vec<_>>();
-            state.notice = crate::links_service::gpui_commit(&state.batch, &selected, true);
+            state.notice = if selected.is_empty() {
+                "Select at least one link first.".into()
+            } else {
+                crate::links_service::gpui_commit(&state.batch, &selected, true)
+            };
             window.refresh();
-        });
+        }).when(selected_count == 0, |button| button.opacity(0.45));
         div().size_full().bg(rgb(background_color())).text_color(rgb(foreground_color()))
             .flex().flex_col().gap_3().p_4()
             .child(div().text_2xl().font_weight(gpui::FontWeight::BOLD)
@@ -1393,7 +1410,7 @@ impl Render for MiniView {
                                 div()
                                     .h_full()
                                     .w(px(300.0 * fraction))
-                                    .bg(rgb(0x8d78e8))
+                                    .bg(rgb(accent_color()))
                                     .rounded_sm(),
                             ),
                     )
@@ -1609,8 +1626,7 @@ impl MainView {
                 } else {
                     let runtime = self.manager.read(cx).runtime.clone();
                     if let Some(view) = crate::gpui_confirm::gpui_confirm_view(requested, runtime, self.capture_focus.clone()) {
-                    use gpui::WindowKind;
-                    let bounds = Bounds::centered(None, size(px(600.0), px(420.0)), cx);
+                    let bounds = Bounds::centered(None, size(px(520.0), px(380.0)), cx);
                     if let Some(window) = open_managed_window(
                         &self.manager,
                         cx,
@@ -1618,9 +1634,13 @@ impl MainView {
                         WindowOptions {
                             window_bounds: Some(WindowBounds::Windowed(bounds)),
                             titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Add download")), ..Default::default() }),
-                            kind: WindowKind::PopUp,
+                            // Use a normal system window so Linux/Windows
+                            // window managers expose their native controls.
+                            kind: gpui::WindowKind::Normal,
                             is_resizable: true,
                             is_movable: true,
+                            is_minimizable: true,
+                            window_decorations: Some(gpui::WindowDecorations::Server),
                             ..Default::default()
                         },
                         move |_, cx| cx.new(|_| view),
@@ -2546,6 +2566,8 @@ impl Render for MainView {
                             .px_2()
                             .border_b_1()
                             .border_color(rgb(button_color()))
+                            .when(selected, |row| row.bg(rgb(card_color())))
+                            .hover(|row| row.bg(rgb(button_hover_color())))
                             .child(row_action_button(if selected { "☑" } else { "☐" }, format!("select-{id}"), move |window, app| {
                                 update_manager(&select_manager, app, |manager| manager.toggle_selection(id));
                                 window.refresh();
@@ -2784,17 +2806,17 @@ fn action_button(
     callback: impl Fn(&mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     let label: SharedString = label.into();
-    div()
-        .id(id.into())
+    interactive_button(div().id(id.into())
         .flex_none()
-        .px_3()
-        .py_2()
+        .px_2()
+        .py_1()
+        .text_sm()
+        .text_color(rgb(foreground_color()))
         .bg(rgb(button_color()))
         .hover(|style| style.bg(rgb(button_hover_color())))
         .rounded_sm()
         .cursor_pointer()
-        .child(label)
-        .on_click(move |_, window, cx| callback(window, cx))
+        .child(label), callback)
 }
 
 fn command_button(
@@ -2804,8 +2826,7 @@ fn command_button(
     callback: impl Fn(&mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     let label: SharedString = label.into();
-    div()
-        .id(id.into())
+    interactive_button(div().id(id.into())
         .flex_none()
         .px_2()
         .py_1()
@@ -2816,8 +2837,7 @@ fn command_button(
         .when(primary, |style| style.hover(|style| style.bg(rgb(accent_hover_color()))))
         .rounded_sm()
         .cursor_pointer()
-        .child(label)
-        .on_click(move |_, window, cx| callback(window, cx))
+        .child(label), callback)
 }
 
 fn sidebar_button(
@@ -2828,8 +2848,7 @@ fn sidebar_button(
     callback: impl Fn(&mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     let label: SharedString = label.into();
-    div()
-        .id(id.into())
+    interactive_button(div().id(id.into())
         .flex()
         .items_center()
         .justify_between()
@@ -2843,8 +2862,7 @@ fn sidebar_button(
         .rounded_sm()
         .cursor_pointer()
         .child(label)
-        .child(div().text_xs().font_family("monospace").text_color(rgb(muted_color())).child(count.to_string()))
-        .on_click(move |_, window, cx| callback(window, cx))
+        .child(div().text_xs().font_family("monospace").text_color(rgb(muted_color())).child(count.to_string())), callback)
 }
 
 fn row_action_button(
@@ -2853,8 +2871,7 @@ fn row_action_button(
     callback: impl Fn(&mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     let label: SharedString = label.into();
-    div()
-        .id(id.into())
+    interactive_button(div().id(id.into())
         .flex_none()
         .px_2()
         .py_1()
@@ -2863,22 +2880,38 @@ fn row_action_button(
         .hover(|style| style.bg(rgb(button_hover_color())).text_color(rgb(foreground_color())))
         .rounded_sm()
         .cursor_pointer()
-        .child(label)
-        .on_click(move |_, window, cx| callback(window, cx))
+        .child(label), callback)
+}
+
+fn interactive_button(
+    element: gpui::Stateful<gpui::Div>,
+    callback: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let callback = Arc::new(callback);
+    let click = callback.clone();
+    element
+        .focusable()
+        .focus(|style| style.border_1().border_color(rgb(accent_color())))
+        .on_click(move |_, window, cx| click(window, cx))
+        .on_key_down(move |event: &KeyDownEvent, window, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                callback(window, cx);
+            }
+        })
 }
 
 fn light_theme() -> bool {
     model::ui_pref_str("theme", "system") == "light"
 }
 
-fn background_color() -> u32 { if light_theme() { 0xf4f5f8 } else { 0x11131b } }
-fn foreground_color() -> u32 { if light_theme() { 0x202331 } else { 0xe6e8ef } }
-fn card_color() -> u32 { if light_theme() { 0xffffff } else { 0x1a1d29 } }
-fn muted_color() -> u32 { if light_theme() { 0x626b7a } else { 0x9aa2b8 } }
-fn button_color() -> u32 { if light_theme() { 0xe5e8ef } else { 0x292d3d } }
-fn button_hover_color() -> u32 { if light_theme() { 0xd6dbe5 } else { 0x373c50 } }
-fn accent_color() -> u32 { if light_theme() { 0x6652bd } else { 0x4b3b88 } }
-fn accent_hover_color() -> u32 { if light_theme() { 0x5844aa } else { 0x5a4a98 } }
+fn background_color() -> u32 { if light_theme() { 0xf5f6f8 } else { 0x0b0c0e } }
+fn foreground_color() -> u32 { if light_theme() { 0x20242b } else { 0xf0f3f6 } }
+fn card_color() -> u32 { if light_theme() { 0xffffff } else { 0x111317 } }
+fn muted_color() -> u32 { if light_theme() { 0x626b7a } else { 0x8b949e } }
+fn button_color() -> u32 { if light_theme() { 0xe7e9ed } else { 0x16191e } }
+fn button_hover_color() -> u32 { if light_theme() { 0xd9dde3 } else { 0x21262d } }
+fn accent_color() -> u32 { if light_theme() { 0x2563eb } else { 0x3b82f6 } }
+fn accent_hover_color() -> u32 { if light_theme() { 0x1d4ed8 } else { 0x2563eb } }
 
 fn settings_row(
     title: impl Into<SharedString>,
@@ -2911,7 +2944,7 @@ fn settings_row(
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = *self.pane.lock().unwrap_or_else(|error| error.into_inner());
-        let mut rows = div().flex().flex_col().gap_2().w_full();
+        let mut rows = div().id("settings-pane-rows").flex_1().min_h_0().flex().flex_col().gap_2().w_full().overflow_scroll();
         match pane {
             SettingsPane::Appearance => {
                 let theme = model::ui_pref_str("theme", "system");
@@ -3424,10 +3457,7 @@ impl ProgressView {
         }
     }
 
-    fn close(window: &mut Window, id: u64, snapshot: &crate::progress_service::GpuiProgressSnapshot) {
-        if snapshot.item.as_ref().is_some_and(|item| matches!(&item.status, Status::Downloading | Status::Queued)) {
-            crate::progress_service::gpui_command(id, "pause");
-        }
+    fn close(window: &mut Window) {
         window.remove_window();
     }
 
@@ -3459,7 +3489,7 @@ impl Render for ProgressView {
                 item.status.label()
             }
         }).unwrap_or_else(|| "No longer in the queue".into());
-        let mut body = div().id("settings-browser-body").flex().flex_col().gap_1().w_full().overflow_scroll();
+        let mut body = div().id("progress-tab-body").flex_1().min_h_0().flex().flex_col().gap_1().w_full().overflow_scroll();
 
         if let Some(item) = &item {
             match tab {
@@ -3511,9 +3541,13 @@ impl Render for ProgressView {
                         ));
                 }
                 ProgressTab::Log => {
-                    body = body.children(snapshot.log_lines.iter().cloned().map(|line| {
-                        div().w_full().text_xs().child(line)
-                    }));
+                    body = if snapshot.log_lines.is_empty() {
+                        body.child(div().text_sm().text_color(rgb(muted_color())).child("No transfer log entries yet."))
+                    } else {
+                        body.children(snapshot.log_lines.iter().cloned().map(|line| {
+                            div().w_full().text_xs().font_family("monospace").child(line)
+                        }))
+                    };
                 }
             }
         } else {
@@ -3532,7 +3566,6 @@ impl Render for ProgressView {
             parts = parts.child(Self::info_row("Stream fragments", format!("{index} / {count}")));
         }
 
-        let close_snapshot = snapshot.clone();
         let mut actions = div().flex().gap_2().w_full();
         if let Some(item) = &item {
             match &item.status {
@@ -3570,7 +3603,7 @@ impl Render for ProgressView {
             }
         }
         actions = actions.child(action_button("Close", "progress-close", move |window, _cx| {
-            Self::close(window, id, &close_snapshot);
+            Self::close(window);
         }));
 
         div()
@@ -3596,7 +3629,7 @@ impl Render for ProgressView {
             .child(div().flex().flex_col().gap_1().child(div().h(px(10.0)).w_full().bg(rgb(button_color())).rounded_sm().child(
                 div().h_full().w(px(420.0 * fraction)).bg(rgb(accent_color())).rounded_sm(),
             )).child(div().text_xs().text_color(rgb(muted_color())).child(format!("{:.0}%", fraction * 100.0))))
-            .child(parts)
+            .when(tab == ProgressTab::Speed, |layout| layout.child(parts))
             .child(actions)
     }
 }
@@ -3613,6 +3646,21 @@ impl Render for CompleteView {
         } else {
             format!("Downloaded {} ({} bytes) · {}", model::format_bytes(item.downloaded_bytes), item.downloaded_bytes, item.resolution)
         };
+        let address = item.url.clone();
+        let copy_address = action_button("Copy address", "complete-copy-address", move |window, _cx| {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                let _ = clipboard.set_text(address.clone());
+            }
+            window.refresh();
+        });
+        let copy_path = item.dest_path().to_string_lossy().to_string();
+        let copy_saved_path = copy_path.clone();
+        let copy_path_button = action_button("Copy path", "complete-copy-path", move |window, _cx| {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                let _ = clipboard.set_text(copy_saved_path.clone());
+            }
+            window.refresh();
+        });
         let mut actions = div().flex().gap_2().w_full()
             .child(action_button("Open", "complete-open", move |window, _cx| {
                 crate::platform::open(&path, false);
@@ -3648,10 +3696,12 @@ impl Render for CompleteView {
             .child(div().text_sm().text_color(rgb(muted_color())).child(summary))
             .child(div().flex().flex_col().gap_1()
                 .child(div().text_xs().text_color(rgb(muted_color())).child("Address"))
-                .child(div().w_full().p_2().bg(rgb(card_color())).rounded_sm().text_sm().child(item.url.clone())))
+                .child(div().w_full().p_2().bg(rgb(card_color())).rounded_sm().text_xs().font_family("monospace").child(item.url.clone()))
+                .child(copy_address))
             .child(div().flex().flex_col().gap_1()
                 .child(div().text_xs().text_color(rgb(muted_color())).child("The file saved as"))
-                .child(div().w_full().p_2().bg(rgb(card_color())).rounded_sm().text_sm().child(item.dest_path().to_string_lossy().to_string())))
+                .child(div().w_full().p_2().bg(rgb(card_color())).rounded_sm().text_xs().font_family("monospace").child(copy_path))
+                .child(copy_path_button))
             .child(actions)
             .child(action_button(
                 if dont_show { "✓  Don't show this dialog again" } else { "□  Don't show this dialog again" },
@@ -3683,6 +3733,10 @@ pub fn run(runtime: Arc<tokio::runtime::Runtime>) {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from(model::APP_NAME)), ..Default::default() }),
+                    is_resizable: true,
+                    is_movable: true,
+                    is_minimizable: true,
+                    window_decorations: Some(gpui::WindowDecorations::Server),
                     ..Default::default()
                 },
                 move |window, cx| {
