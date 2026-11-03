@@ -55,12 +55,6 @@ pub fn pac_proxy_for(script: &str, url: &str) -> Option<String> {
     v
 }
 
-/// The fixed proxy in the system's settings (Settings → Proxy → Get system):
-/// (proxy list as Windows stores it, PAC script URL).
-pub fn system_settings() -> (Option<String>, Option<String>) {
-    imp::system_settings()
-}
-
 /// WinHTTP's answer is a list ("a:8080; b:3128" or "http=a:80;https=b:443"):
 /// take the first entry that fits the URL's scheme.
 fn pick(list: &str, url: &str) -> Option<String> {
@@ -126,19 +120,6 @@ mod imp {
         matches!(ie_config(), Some((auto, pac)) if auto || pac.is_some())
     }
 
-    pub fn system_settings() -> (Option<String>, Option<String>) {
-        unsafe {
-            let mut c: WINHTTP_CURRENT_USER_IE_PROXY_CONFIG = std::mem::zeroed();
-            if WinHttpGetIEProxyConfigForCurrentUser(&mut c) == 0 {
-                return (None, None);
-            }
-            let pac = take(c.lpszAutoConfigUrl).filter(|s| !s.trim().is_empty());
-            let proxy = take(c.lpszProxy).filter(|s| !s.trim().is_empty());
-            let _ = take(c.lpszProxyBypass);
-            (proxy, pac)
-        }
-    }
-
     pub fn resolve(url: &str) -> Option<String> {
         resolve_with(url, ie_config()?)
     }
@@ -193,11 +174,7 @@ mod imp {
     pub fn resolve_with(_url: &str, _cfg: (bool, Option<String>)) -> Option<String> {
         None
     }
-    pub fn system_settings() -> (Option<String>, Option<String>) {
-        let env = std::env::var("https_proxy").or_else(|_| std::env::var("HTTPS_PROXY"))
-            .or_else(|_| std::env::var("http_proxy")).or_else(|_| std::env::var("HTTP_PROXY")).ok();
-        (env.filter(|s| !s.trim().is_empty()), None)
-    }
+
 }
 
 #[cfg(test)]

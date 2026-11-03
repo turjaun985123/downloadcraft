@@ -136,10 +136,8 @@ pub(crate) fn gpui_confirm_view(
         proxy_url: prefs.proxy_url, timeout_secs: prefs.timeout_secs,
         rename_template: prefs.rename_template, folder_rules: prefs.folder_rules,
         probing: false, probe_size: known_size, browser_size: known_size, probe_rx: None,
-        rt: Some(runtime), centered: false, show_adv: false, done: false,
-        waiting_app: None, exited: false, notice: initial_notice,
-        cat_open: false, recent_open: false, win_h: 0.0, adding_cat: false,
-        new_cat: String::new(), custom_cats: Vec::new(),
+        rt: Some(runtime), done: false,
+        waiting_app: None, notice: initial_notice,
     };
     if known_size.is_none() { app.start_probe(); }
     Some(GpuiConfirmView { app, _confirm_slot: slot, filename_focus, capture: Some(item), capture_acknowledged: false })

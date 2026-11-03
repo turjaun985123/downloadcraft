@@ -84,33 +84,12 @@ pub(crate) struct ConfirmApp {
     pub(crate) auto_name: Option<String>,
     pub(crate) probe_rx: Option<Receiver<(Option<u64>, Option<String>)>>,
     pub(crate) rt: Option<tokio::runtime::Handle>,
-    pub(crate) centered: bool,
-    pub(crate) show_adv: bool,
     pub(crate) done: bool,
     /// Download was pressed while the app was closed: it was started at this
     /// moment and the download is handed over once it is live (issue #7).
     pub(crate) waiting_app: Option<std::time::Instant>,
-    pub(crate) exited: bool,
     pub(crate) notice: String,
-    /// State for controls the concept does not show (dropdown + extras).
-    pub(crate) cat_open: bool,
-    /// Path field's recent-folders menu (same pattern as the category combo).
-    pub(crate) recent_open: bool,
-    pub(crate) win_h: f32,
-    pub(crate) adding_cat: bool,
-    pub(crate) new_cat: String,
-    pub(crate) custom_cats: Vec<String>,
 }
-
-pub(crate) const CATEGORIES: &[&str] = &[
-    "Video",
-    "Music",
-    "Image",
-    "Document",
-    "Compressed",
-    "Apps",
-    "Other",
-];
 
 impl ConfirmApp {
     pub(crate) fn effective_dir(&self) -> String {
@@ -133,46 +112,6 @@ impl ConfirmApp {
         } else {
             self.save_base.clone()
         }
-    }
-
-    /// Recent folders for the path field's caret: the shell folders first,
-    /// then whatever the field currently holds (mirrors the main window).
-    pub(crate) fn recent_dirs(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for d in [
-            dirs::download_dir(),
-            dirs::desktop_dir(),
-            dirs::document_dir(),
-            dirs::picture_dir(),
-            dirs::video_dir(),
-            dirs::audio_dir(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let s = d.to_string_lossy().to_string();
-            if !out.contains(&s) {
-                out.push(s);
-            }
-        }
-        let cur = self.save_base.trim().to_string();
-        if !cur.is_empty() && !out.contains(&cur) {
-            out.push(cur);
-        }
-        out
-    }
-
-    /// Extra one-line facts the concept has no place for; shown under the
-    /// hidden extras panel only.
-    pub(crate) fn extra_notes(&self) -> Vec<String> {
-        let mut v = Vec::new();
-        if self.pair_url.starts_with("http") {
-            v.push("video-only + audio — merged on completion (needs ffmpeg)".to_string());
-        }
-        if !self.quality_pref.trim().is_empty() {
-            v.push(format!("Quality: {}", self.quality_pref.trim()));
-        }
-        v
     }
 
     /// Start downloading in the background while the dialog is open, for a
@@ -607,18 +546,9 @@ pub(crate) fn build_confirm_app() -> Option<(ConfirmApp, std::fs::File, std::syn
         probe_size: known_size,
         probe_rx: None,
         rt: Some(rt.handle().clone()),
-        centered: false,
-        show_adv: false,
         done: false,
         waiting_app: None,
-        exited: false,
         notice: initial_notice,
-        cat_open: false,
-        recent_open: false,
-        win_h: 0.0,
-        adding_cat: false,
-        new_cat: String::new(),
-        custom_cats: Vec::new(),
     };
     // Prefill filename from server when the extension sent none useful.
     // A browser-known size skips probing entirely (server re-probes of

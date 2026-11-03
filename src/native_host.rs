@@ -25,8 +25,6 @@ struct Incoming {
     #[serde(rename = "type")]
     kind: String,
     /// "report": one line for the app's log (a site's layout changed, ...).
-    #[serde(default)]
-    note: Option<String>,
     url: Option<String>,
     filename: Option<String>,
     /// Stable per-capture id. Unlike `rid`, this survives a persistent-port
@@ -441,45 +439,6 @@ pub struct InboxItem {
     pub audio_expected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser: Option<crate::model::BrowserContext>,
-}
-
-/// Lines the browser extension asked to show in the app's log.
-pub fn notes_path() -> Option<std::path::PathBuf> {
-    crate::model::config_dir().map(|p| p.join("extension_notes.txt"))
-}
-
-/// Append one note (single line, bounded); the file is capped so a page
-/// that reports in a loop cannot grow it.
-fn append_extension_note(text: &str) {
-    let Some(path) = notes_path() else { return };
-    let line: String = text.chars().filter(|c| !c.is_control()).take(300).collect();
-    if line.trim().is_empty() {
-        return;
-    }
-    let _guard = crate::model::fs_lock("extension_notes");
-    let mut lines: Vec<String> = std::fs::read_to_string(&path)
-        .map(|s| s.lines().map(str::to_string).collect())
-        .unwrap_or_default();
-    if lines.iter().any(|l| l == &line) {
-        return;
-    }
-    lines.push(line);
-    let keep = lines.len().saturating_sub(50);
-    let _ = std::fs::write(&path, lines[keep..].join("
-") + "
-");
-}
-
-/// Take every pending note (the app shows them in its log).
-pub fn take_extension_notes() -> Vec<String> {
-    let Some(path) = notes_path() else { return Vec::new() };
-    let _guard = crate::model::fs_lock("extension_notes");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let _ = std::fs::remove_file(&path);
-    text.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect()
 }
 
 pub fn inbox_path() -> Option<std::path::PathBuf> {
@@ -1025,7 +984,8 @@ fn page_fetch_chunk(msg: &Incoming) -> Result<(), String> {
         return Err("bad fetch id".into());
     }
     let dir = page_fetch_dir().ok_or("no config dir")?;
-    if !dir.join(format!("{id}.req.json")).exists() {
+    let request = dir.join(format!("{id}.req.json"));
+    if !is_regular_file(&request) {
         return Err("no such fetch request".into());
     }
     let part = dir.join(format!("{id}.part"));
@@ -1036,12 +996,27 @@ fn page_fetch_chunk(msg: &Incoming) -> Result<(), String> {
     }
     if let Some(c) = msg.chunk.as_deref().filter(|c| !c.is_empty()) {
         let bytes = crate::model::base64_decode(c).ok_or("bad chunk")?;
+        let existing_size = match std::fs::symlink_metadata(&part) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata.len(),
+            Ok(_) => return Err("invalid page-fetch partial file".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.to_string()),
+        };
+        let next_size = existing_size
+            .checked_add(bytes.len() as u64)
+            .ok_or("page-fetch response exceeds the size limit")?;
+        if next_size > MAX_PAGE_FETCH_BYTES {
+            return Err("page-fetch response exceeds the size limit".into());
+        }
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&part).map_err(|e| e.to_string())?;
         f.write_all(&bytes).map_err(|e| e.to_string())?;
     }
     if msg.done {
-        if !part.exists() {
+        if !is_regular_file(&part) {
+            if part.exists() {
+                return Err("invalid page-fetch partial file".into());
+            }
             std::fs::write(&part, b"").map_err(|e| e.to_string())?;
         }
         std::fs::rename(&part, dir.join(format!("{id}.res"))).map_err(|e| e.to_string())?;
@@ -1315,12 +1290,6 @@ pub fn run() {
                 Ok(()) => write_message(&Reply::ok()),
                 Err(e) => write_message(&Reply::err(e)),
             },
-            "report" => {
-                if let Some(text) = msg.note.as_deref() {
-                    append_extension_note(text);
-                }
-                write_message(&Reply::ok());
-            }
             "ping" => write_message(&{ note_extension_seen(); Reply {
                 kind: "pong".into(),
                 version: Some(1),
@@ -1364,14 +1333,6 @@ pub fn run() {
                     continue;
                 }
                 match queue_download(&msg) {
-                    // A row is waiting for a fresh link ("Refresh download
-                    // address"): the app takes this capture, no dialog.
-                    Ok(_) if crate::model::refresh_wait().is_some() => {
-                        if let Some(id) = msg.capture_id.as_deref() {
-                            mark_capture_dialog_spawned(id);
-                        }
-                        write_message(&Reply::ok());
-                    }
                     Ok(should_prompt) => {
                         write_message(&Reply::ok());
                         let gui_accepts_captures = matches!(

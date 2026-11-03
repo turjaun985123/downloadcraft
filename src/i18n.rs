@@ -88,45 +88,11 @@ pub fn t(english: &str) -> &str {
 
 /// Every translated text once (the first call only), so the fonts for its
 /// script can be loaded before it is drawn.
-pub fn take_font_text() -> Option<String> {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return None;
-    }
-    let l = state().lock().ok()?;
-    (!l.map.is_empty()).then(|| l.map.values().copied().collect::<Vec<_>>().join(" "))
-}
+
 
 /// The languages there are files for: (code, name shown in the picker).
 /// English is always first.
-pub fn available() -> Vec<(String, String)> {
-    let mut v = vec![("en".to_string(), "English".to_string())];
-    for (code, json) in BUILTIN {
-        let name = serde_json::from_str::<serde_json::Value>(json)
-            .ok()
-            .and_then(|j| j.get("@name").and_then(|n| n.as_str()).map(str::to_string))
-            .unwrap_or_else(|| code.to_string());
-        v.push((code.to_string(), name));
-    }
-    for dir in lang_dirs() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(code) = name.strip_suffix(".json").filter(|c| !c.contains('.')) else { continue };
-            if v.iter().any(|(c, _)| c == code) {
-                continue;
-            }
-            // A file may name itself: {"@name": "বাংলা"}.
-            let label = std::fs::read_to_string(e.path())
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|j| j.get("@name").and_then(|n| n.as_str()).map(str::to_string))
-                .unwrap_or_else(|| code.to_string());
-            v.push((code.to_string(), label));
-        }
-    }
-    v
-}
+
 
 #[cfg(test)]
 mod tests {

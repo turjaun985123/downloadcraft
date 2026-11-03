@@ -19,7 +19,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A release asset: where it is and what it must hash to.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -535,40 +535,7 @@ fn remove_dropped(target: &Path, files: &[PathBuf]) {
     let _ = write_atomic(&target.join(MANIFEST), text.as_bytes());
 }
 
-/// Remove `.dcold` leftovers in the app's folder and stale update folders
-/// (best effort, at start). Only this program's own prefix is touched, and
-/// only when it is at least a day old, so a concurrent update survives.
-pub fn cleanup() {
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
-        if let Ok(files) = files_under(&dir) {
-            for rel in files {
-                if rel.to_string_lossy().ends_with(OLD_SUFFIX) {
-                    let _ = std::fs::remove_file(dir.join(rel));
-                }
-            }
-        }
-    }
-    let base = std::env::temp_dir();
-    // The pre-0.9.13 updater used this fixed name; it is never current.
-    let _ = std::fs::remove_dir_all(base.join("download-craft-update"));
-    let Ok(entries) = std::fs::read_dir(&base) else { return };
-    let day = Duration::from_secs(24 * 60 * 60);
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("download-craft-update-") {
-            continue;
-        }
-        let stale = e
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > day);
-        if stale {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
-}
+
 
 /// Start the (new) program; it waits for this process to end first.
 pub fn relaunch() -> Result<()> {

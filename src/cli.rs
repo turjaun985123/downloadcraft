@@ -84,6 +84,16 @@ pub enum Commands {
     Peek {
         url: String,
     },
+    /// Safely extract a local ZIP, RAR, or 7z archive
+    Extract {
+        archive: String,
+        /// Extract into this directory instead of creating an archive-named folder
+        #[arg(short, long, conflicts_with = "here")]
+        output_dir: Option<String>,
+        /// Extract beside the archive without creating a folder
+        #[arg(long)]
+        here: bool,
+    },
     /// Remove an item from the queue (keeps the file)
     Remove {
         id: u64,
@@ -331,6 +341,33 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             println!("{} entries, {} unpacked", entries.len(), format_bytes(total));
+            Ok(())
+        }
+        Commands::Extract { archive, output_dir, here } => {
+            let archive = std::path::PathBuf::from(archive);
+            let kind = archive
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(crate::archive::volume_of)
+                .map(|volume| volume.kind.label())
+                .unwrap_or("archive");
+            let dest = output_dir
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| crate::archive::destination(&archive, !here));
+            let outcome = crate::archive::extract(&archive, &dest)
+                .map_err(|error| anyhow::anyhow!("could not extract {}: {error}", archive.display()))?;
+            println!(
+                "{kind}: extracted {} file(s), {} into {}",
+                outcome.files,
+                format_bytes(outcome.bytes),
+                outcome.dest.display()
+            );
+            if outcome.skipped > 0 || outcome.refused > 0 {
+                println!("kept {} existing file(s); refused {} unsafe entr(y/ies)", outcome.skipped, outcome.refused);
+            }
+            if !outcome.complete() {
+                println!("extraction finished with skipped or refused entries");
+            }
             Ok(())
         }
         Commands::Remove { id } => {

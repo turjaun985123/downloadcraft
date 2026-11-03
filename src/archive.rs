@@ -91,6 +91,7 @@ pub fn volume_of(name: &str) -> Option<Volume> {
 }
 
 /// Does file `name` belong to the multi-part set `set` (see [`Volume::set`])?
+#[cfg(test)]
 pub fn in_set(name: &str, set: &str) -> bool {
     volume_of(name).and_then(|v| v.set).is_some_and(|s| s == set)
 }

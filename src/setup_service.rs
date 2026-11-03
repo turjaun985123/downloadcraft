@@ -123,7 +123,7 @@ fn fix(part: Part) -> Result<(), String> {
         Part::Connection => {
             let mut errors = Vec::new();
             for browser in BROWSERS {
-                if let Err(error) = crate::integration::install_native_host(browser) {
+                if let Err(error) = crate::integration::ensure_native_host(browser) {
                     errors.push(format!("{browser}: {error}"));
                 }
             }
@@ -175,12 +175,6 @@ pub(crate) fn helper_lines() -> Vec<(&'static str, String, bool)> {
             State::Checking => (part.title(), String::new(), false),
         })
         .collect()
-}
-
-pub(crate) fn something_missing() -> bool {
-    !crate::engine::helpers_present()
-        || extension_seen().is_none()
-        || !BROWSERS.iter().any(|browser| crate::integration::native_host_status(browser))
 }
 
 pub(crate) fn extension_directory() -> Option<std::path::PathBuf> {

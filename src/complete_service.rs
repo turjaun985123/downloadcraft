@@ -12,14 +12,10 @@ pub(crate) fn gpui_item(id: u64) -> Option<DownloadItem> {
     read_item(id)
 }
 
+#[cfg(windows)]
 pub(crate) fn gpui_open_with(path: &std::path::Path) {
-    #[cfg(windows)]
-    {
-        let _ = crate::platform::silent_command("rundll32.exe")
-            .arg("shell32.dll,OpenAs_RunDLL")
-            .arg(path)
-            .spawn();
-    }
-    #[cfg(not(windows))]
-    crate::platform::open(path, false);
+    let _ = crate::platform::silent_command("rundll32.exe")
+        .arg("shell32.dll,OpenAs_RunDLL")
+        .arg(path)
+        .spawn();
 }

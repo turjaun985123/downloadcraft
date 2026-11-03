@@ -194,13 +194,6 @@ impl SharedState {
         }
     }
 
-    /// The recorded resolution, or an empty string.
-    pub fn resolution_now(&self) -> String {
-        self.resolution
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_else(|e| e.into_inner().clone())
-    }
 }
 
 /// Map an I/O error to a user-facing message, with a clear text for a
@@ -237,11 +230,6 @@ impl CredentialScope {
             return None;
         }
         Some(Self { host, secure_only: u.scheme() == "https" })
-    }
-
-    /// The exact host this credential may be sent to.
-    pub fn host(&self) -> &str {
-        &self.host
     }
 
     /// Whether `url` is inside this credential's boundary.
@@ -469,34 +457,6 @@ fn referer_for(referer: &str, url: Option<&str>) -> String {
     r.to_string()
 }
 
-/// Registrable site of a URL's host ("a.b.example.co.uk" -> "example.co.uk",
-/// "rr1.googlevideo.com" -> "googlevideo.com"). Approximate public-suffix
-/// handling: a two-letter country TLD under a short second level (co.uk,
-/// com.au) keeps three labels.
-fn site_of_url(url: &str) -> Option<String> {
-    let host = reqwest::Url::parse(url).ok()?.host_str()?.trim_end_matches('.').to_ascii_lowercase();
-    if host.parse::<std::net::IpAddr>().is_ok() || !host.contains('.') {
-        return Some(host);
-    }
-    // Multi-tenant hosting: every customer has its own subdomain, so the
-    // site is the whole host (d111.cloudfront.net is not d222's).
-    const SHARED_SUFFIXES: &[&str] = &[
-        "cloudfront.net", "akamaized.net", "akamaihd.net", "edgesuite.net", "azureedge.net",
-        "blob.core.windows.net", "fastly.net", "b-cdn.net", "r2.dev", "r2.cloudflarestorage.com",
-        "workers.dev", "pages.dev", "github.io", "githubusercontent.com", "gitlab.io",
-        "herokuapp.com", "appspot.com", "web.app", "firebaseapp.com", "netlify.app",
-        "vercel.app", "amazonaws.com", "storage.googleapis.com", "googleusercontent.com",
-        "digitaloceanspaces.com", "backblazeb2.com", "onrender.com", "fly.dev",
-    ];
-    if SHARED_SUFFIXES.iter().any(|s| host.ends_with(&format!(".{s}"))) {
-        return Some(host);
-    }
-    let labels: Vec<&str> = host.split('.').collect();
-    let n = labels.len();
-    let keep = if n >= 3 && labels[n - 1].len() == 2 && labels[n - 2].len() <= 3 { 3 } else { 2 };
-    Some(labels[n.saturating_sub(keep)..].join("."))
-}
-
 impl Default for EngineOpts {
     fn default() -> Self {
         Self {
@@ -609,21 +569,6 @@ pub fn move_partial(from: &std::path::Path, to: &std::path::Path) -> bool {
         moved |= ok;
     }
     moved
-}
-
-/// Every unfinished-data path of `dest` (for deleting leftovers).
-pub fn partial_paths(dest: &std::path::Path) -> Vec<PathBuf> {
-    let mut v = vec![
-        downloadcraft_engine::data_path(dest),
-        downloadcraft_engine::journal_path(dest),
-        dest.with_extension("dcftp"),
-        dest.with_extension("dcftpparts"),
-    ];
-    if let Some(w) = work_dir() {
-        v.push(downloadcraft_engine::data_path_in(dest, Some(&w)));
-        v.push(downloadcraft_engine::journal_path_in(dest, Some(&w)));
-    }
-    v
 }
 
 impl EngineOpts {
@@ -4291,6 +4236,7 @@ pub async fn download(
     }
     job_log(&log, format!("done: {} bytes", shared.downloaded.load(Ordering::SeqCst)));
     verify_completed_media(&dest, &shared).await?;
+    crate::model::record_finished_bytes(shared.downloaded.load(Ordering::SeqCst));
     cleanup_completed_job(&dest, &shared);
     Ok(())
 }
@@ -5598,14 +5544,6 @@ fn js_runtime() -> Option<&'static str> { js_runtime_path().map(|(name,_)| name)
 /// The Deno runtime yt-dlp will be told about, if one is available.
 pub fn js_runtime_name() -> Option<&'static str> { js_runtime() }
 
-/// yt-dlp, ffmpeg and a JavaScript runtime are all there (file checks only,
-/// no version probes: cheap enough for start-up).
-pub fn helpers_present() -> bool {
-    let local = ytdlp_local_path().filter(|p| crate::platform::executable_file(p));
-    let ytdlp = ytdlp_on_path().is_some() || ytdlp_custom_path().is_some() || local.is_some();
-    ytdlp && ffmpeg_path().is_some() && js_runtime().is_some()
-}
-
 /// Where the app keeps its own Deno (next to its yt-dlp).
 pub fn deno_local_path() -> Option<std::path::PathBuf> {
     Some(crate::platform::helper_dir()?.join(if cfg!(windows) { "deno.exe" } else { "deno" }))
@@ -5756,77 +5694,6 @@ fn ytdlp_preferred(opts: &EngineOpts) -> bool {
     quality_cap(&opts.quality_pref).map(|h| h > 360).unwrap_or(true)
 }
 
-/// A YouTube playlist or channel page (not one video): its videos are listed
-/// for picking instead of being downloaded as one file.
-pub fn is_youtube_list(url: &str) -> bool {
-    let Ok(u) = reqwest::Url::parse(url) else { return false };
-    let host = u.host_str().unwrap_or("").trim_start_matches("www.").trim_start_matches("m.");
-    if host != "youtube.com" {
-        return false;
-    }
-    let path = u.path().trim_end_matches('/');
-    (path == "/playlist" && u.query_pairs().any(|(k, _)| k == "list"))
-        || path.starts_with("/@")
-        || path.starts_with("/channel/")
-        || path.starts_with("/c/")
-        || path.starts_with("/user/")
-}
-
-/// The videos of a playlist / channel: (watch URL, title), via yt-dlp's
-/// flat listing (no video is downloaded). The list's own title comes first.
-pub async fn playlist_entries(url: &str, opts: &EngineOpts) -> Result<(String, Vec<(String, String)>)> {
-    let client = opts.build_client()?;
-    let exe = ensure_ytdlp(&client).await?;
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.arg("--flat-playlist").arg("-J").arg("--no-warnings");
-    if let Some((name, path)) = js_runtime_path() {
-        cmd.arg("--js-runtimes").arg(format!("{name}:{}", path.display()));
-    }
-    if let Some(p) = opts.effective_proxy(url) {
-        cmd.arg("--proxy").arg(p);
-    }
-    cmd.arg(url).stdin(std::process::Stdio::null());
-    let out = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
-        .await
-        .map_err(|_| anyhow!("listing the playlist took too long"))??;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow!("yt-dlp could not list it: {}", err.lines().last().unwrap_or("unknown error")));
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-    let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("Playlist").to_string();
-    let mut list = Vec::new();
-    // Channels nest their tabs (Videos, Shorts) one level down.
-    let mut stack: Vec<&serde_json::Value> = vec![&v];
-    while let Some(node) = stack.pop() {
-        for e in node.get("entries").and_then(|e| e.as_array()).into_iter().flatten().rev() {
-            if e.get("entries").is_some() {
-                stack.push(e);
-                continue;
-            }
-            let id = e.get("id").and_then(|x| x.as_str()).unwrap_or("");
-            let link = e
-                .get("url")
-                .and_then(|x| x.as_str())
-                .filter(|u| u.starts_with("http"))
-                .map(str::to_string)
-                .or_else(|| (!id.is_empty()).then(|| format!("https://www.youtube.com/watch?v={id}")));
-            if let Some(link) = link {
-                let t = e.get("title").and_then(|x| x.as_str()).unwrap_or(id).to_string();
-                list.push((link, t));
-            }
-        }
-    }
-    list.truncate(5000);
-    Ok((title, list))
-}
-
 /// Which YouTube engine runs first (Settings -> Plugins -> YouTube):
 /// "native" = the app's own engine, then yt-dlp; "ytdlp" = yt-dlp, then the
 /// app's engine; "auto" (default) = whichever can deliver the requested
@@ -5844,40 +5711,6 @@ fn youtube_ytdlp_first(opts: &EngineOpts) -> bool {
 /// app fetched (refreshed when it has gone stale, since YouTube moves on).
 /// `Err` means nothing is available and the caller should stay with the
 /// built-in engine.
-/// First-run readiness, run in the background when the app starts: fetch
-/// every helper that is missing (yt-dlp, ffmpeg, and Deno — the JavaScript
-/// runtime yt-dlp needs for YouTube), so the first video download does not
-/// stop to fetch them. Sources the user set to their own copy or PATH are
-/// left alone; a present helper costs one file check (yt-dlp is also
-/// refreshed when it is over a month old). Returns lines for the app's log.
-pub async fn prepare_helpers() -> Vec<String> {
-    let mut log = Vec::new();
-    let client = match EngineOpts::default().build_client() {
-        Ok(c) => c,
-        Err(e) => return vec![format!("Helpers: could not start a download client ({e:#})")],
-    };
-    let had_ytdlp = ytdlp_info().path.is_some();
-    match ensure_ytdlp(&client).await {
-        Ok(_) if !had_ytdlp => log.push("yt-dlp installed (video sites).".to_string()),
-        Ok(_) => {}
-        Err(e) => log.push(format!("yt-dlp could not be fetched yet ({e:#}) — it is tried again when a video needs it.")),
-    }
-    if ffmpeg_path().is_none() && FfmpegSource::from_settings() == FfmpegSource::Managed {
-        match ensure_ffmpeg(&client).await {
-            Ok(_) => log.push("ffmpeg installed (joins video and audio).".to_string()),
-            Err(e) => log.push(format!("ffmpeg could not be fetched yet ({e:#}) — it is tried again when a video needs it.")),
-        }
-    }
-    if js_runtime().is_none() {
-        match tokio::task::spawn_blocking(deno_install_blocking).await {
-            Ok(Ok(_)) => log.push("Deno installed (YouTube's player check).".to_string()),
-            Ok(Err(e)) => log.push(format!("Deno could not be fetched yet ({e:#}) — install it from Settings → Download Engine.")),
-            Err(_) => {}
-        }
-    }
-    log
-}
-
 async fn ensure_ytdlp(client: &reqwest::Client) -> Result<std::path::PathBuf> {
     let source=YtdlpSource::from_settings();
     let local=ytdlp_local_path().filter(|p|crate::platform::executable_file(p));
@@ -5945,71 +5778,12 @@ async fn fetch_ytdlp(client: &reqwest::Client, dst: &std::path::Path) -> Result<
     Ok(())
 }
 
-/// `--version` of a copy that was just downloaded, with the long first-run
-/// allowance (`platform::first_run_output`).
 fn ytdlp_first_version(exe: &std::path::Path) -> Option<String> {
     let mut cmd = crate::platform::silent_command(exe);
     cmd.arg("--version");
     let out = crate::platform::first_run_output(cmd)?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !v.is_empty()).then_some(v)
-}
-
-/// What Settings shows about the YouTube helper, and the copy it would run.
-#[derive(Debug, Clone, Default)]
-pub struct YtdlpInfo {
-    /// The executable YouTube downloads would use right now.
-    pub path: Option<std::path::PathBuf>,
-    /// True when `path` is the copy this app fetched and keeps current.
-    pub managed: bool,
-    /// `yt-dlp --version`, when the executable answered.
-    pub version: Option<String>,
-    pub size: Option<u64>,
-    /// The managed copy is past its 30-day refresh window.
-    pub stale: bool,
-    /// A copy found on PATH (the app never touches that one).
-    pub on_path: Option<std::path::PathBuf>,
-    /// JS runtime yt-dlp will be told about, if any.
-    pub js_runtime: Option<String>,
-    /// The picked custom executable is set *and* still on disk.
-    pub custom_ok: bool,
-}
-
-/// What Settings shows about ffmpeg: yt-dlp needs it to merge separate video
-/// and audio streams, which is every YouTube quality above 360p.
-#[derive(Debug, Clone, Default)]
-pub struct FfmpegInfo {
-    pub path: Option<std::path::PathBuf>,
-    pub version: Option<String>,
-    pub size: Option<u64>,
-    pub probe_path: Option<std::path::PathBuf>,
-    /// `path` is the copy this app fetched and keeps in its own folder.
-    pub managed: bool,
-    /// A copy found on PATH (the app never touches that one).
-    pub on_path: Option<std::path::PathBuf>,
-}
-
-impl FfmpegInfo {
-    /// A short line for the card's identity row.
-    pub fn meta(&self) -> String {
-        if self.path.is_none() {
-            return "not installed".to_string();
-        }
-        let mut bits = vec![if self.managed {
-            "own copy".to_string()
-        } else {
-            "on PATH".to_string()
-        }];
-        if let Some(sz) = self.size {
-            bits.push(crate::model::format_bytes(sz));
-        }
-        bits.join(" · ")
-    }
-}
-
-/// Where the app keeps its own yt-dlp (the folder Settings can open).
-pub fn ytdlp_bin_dir() -> Option<std::path::PathBuf> {
-    ytdlp_local_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
 /// Ask the helper for its version. This *runs* it (about a second for the
@@ -6031,6 +5805,22 @@ fn ytdlp_version(exe: &std::path::Path) -> Option<String> {
 
 /// Snapshot for the Settings window. Blocking (it runs the helper to ask its
 /// version): call it from a worker thread.
+#[derive(Debug, Clone, Default)]
+pub struct YtdlpInfo {
+    pub path: Option<std::path::PathBuf>,
+    pub managed: bool,
+    pub version: Option<String>,
+    pub js_runtime: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FfmpegInfo {
+    pub path: Option<std::path::PathBuf>,
+    pub version: Option<String>,
+    pub probe_path: Option<std::path::PathBuf>,
+    pub managed: bool,
+}
+
 pub fn ytdlp_info() -> YtdlpInfo {
     let source = YtdlpSource::from_settings();
     let on_path = ytdlp_on_path();
@@ -6040,23 +5830,11 @@ pub fn ytdlp_info() -> YtdlpInfo {
     // Same order `ensure_ytdlp` uses, so what Settings shows is what a
     // YouTube download would really run.
     let (path, managed) = select_ytdlp(source,on_path.clone(),custom.clone(),local.clone().filter(|_|managed_present));
-    let meta = path.as_deref().and_then(|p| std::fs::metadata(p).ok());
-    let stale = match (managed, local.as_deref()) {
-        (true, Some(p)) => std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .map(|t| t.elapsed().map(|e| e.as_secs() > 30 * 24 * 3600).unwrap_or(false))
-            .unwrap_or(true),
-        _ => false,
-    };
     YtdlpInfo {
         version: path.as_deref().and_then(ytdlp_version),
-        size: meta.as_ref().map(|m| m.len()),
         path,
         managed,
-        stale,
-        on_path,
         js_runtime: js_runtime().map(str::to_string),
-        custom_ok: custom.is_some(),
     }
 }
 
@@ -6070,10 +5848,6 @@ pub fn ytdlp_managed_path() -> Option<std::path::PathBuf> {
 pub fn ffmpeg_info() -> FfmpegInfo {
     let path = ffmpeg_path();
     let version = path.as_deref().and_then(ffmpeg_version);
-    let size = path
-        .as_deref()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len());
     let managed = match (&path, ffmpeg_local_path()) {
         (Some(p), Some(local)) => *p == local,
         _ => false,
@@ -6081,10 +5855,8 @@ pub fn ffmpeg_info() -> FfmpegInfo {
     FfmpegInfo {
         path,
         version,
-        size,
         probe_path: ffprobe_path(),
         managed,
-        on_path: ffmpeg_on_path(),
     }
 }
 
@@ -6124,22 +5896,14 @@ fn ffmpeg_version(exe: &std::path::Path) -> Option<String> {
 
 /// Static builds the app fetches. They are single-file executables (gzip
 /// compressed), so no archive extraction and no DLLs next to them.
-const FFMPEG_GZ_URL: &str = if cfg!(windows) {
-    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-win32-x64.gz"
-} else if cfg!(target_os = "macos") {
-    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-arm64.gz"
-} else {
-    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-x64.gz"
-};
-const FFPROBE_GZ_URL: &str = if cfg!(windows) {
-    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-win32-x64.gz"
-} else if cfg!(target_os = "macos") {
-    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-darwin-arm64.gz"
-} else {
-    "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-linux-x64.gz"
-};
-const FFMPEG_BIN: &str = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-const FFPROBE_BIN: &str = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+#[cfg(windows)]
+const FFMPEG_GZ_URL: &str = "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-win32-x64.gz";
+#[cfg(windows)]
+const FFPROBE_GZ_URL: &str = "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffprobe-win32-x64.gz";
+#[cfg(windows)]
+const FFMPEG_BIN: &str = "ffmpeg.exe";
+#[cfg(windows)]
+const FFPROBE_BIN: &str = "ffprobe.exe";
 
 /// How the user wants ffmpeg sourced — same three-way choice as yt-dlp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6199,11 +5963,6 @@ fn ffmpeg_local_path() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Where the app's own ffmpeg lives, for Settings.
-pub fn ffmpeg_bin_dir() -> Option<std::path::PathBuf> {
-    ffmpeg_local_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
-}
-
 /// A usable ffmpeg, fetching the app's own copy when the source allows it and
 /// nothing else is present. Called right before a merge, so a first 1080p
 /// download sets itself up instead of failing with "install ffmpeg".
@@ -6241,6 +6000,7 @@ pub async fn ensure_ffmpeg(client: &reqwest::Client) -> Result<std::path::PathBu
 
 /// Fetch (or refresh) the app's own ffmpeg + ffprobe. ffprobe is best-effort:
 /// without it the file still plays, only the frame-size read-back is lost.
+#[cfg(windows)]
 async fn fetch_ffmpeg(client: &reqwest::Client, force: bool) -> Result<std::path::PathBuf> {
     let dst = ffmpeg_local_path().ok_or_else(|| anyhow!("no LOCALAPPDATA to keep ffmpeg in"))?;
     fetch_gz_binary(client, FFMPEG_GZ_URL, &dst, "ffmpeg").await.map_err(|e| {
@@ -6260,6 +6020,7 @@ async fn fetch_ffmpeg(client: &reqwest::Client, force: bool) -> Result<std::path
 /// Download a gzip-compressed static executable and unpack it next to `dst`.
 /// The payload lands in a sidecar first and is only renamed into place after
 /// the decompressed file is verified, so a half-written binary is never run.
+#[cfg(windows)]
 async fn fetch_gz_binary(
     client: &reqwest::Client,
     url: &str,
@@ -6702,11 +6463,6 @@ async fn verify_vimeo_audio(dest: &std::path::Path) -> Result<()> {
         return Err(anyhow!("Vimeo download has no audio track — capture the full master manifest or Vimeo player URL instead of a video-only playlist"));
     }
     Ok(())
-}
-
-/// [`ytdlp_format_with`] with the merge capability of this machine.
-fn ytdlp_format(pref: &str) -> String {
-    ytdlp_format_with(pref, ffmpeg_path().is_some())
 }
 
 /// Hand a YouTube link to yt-dlp: it speaks the browser-only SABR protocol
@@ -10277,12 +10033,6 @@ mod tests {
 
     #[test]
     fn captured_headers_stay_on_their_site() {
-        assert_eq!(site_of_url("https://a.b.example.com/x").as_deref(), Some("example.com"));
-        assert_eq!(site_of_url("https://cdn.example.co.uk/x").as_deref(), Some("example.co.uk"));
-        assert_eq!(site_of_url("http://127.0.0.1:8080/x").as_deref(), Some("127.0.0.1"));
-        // Shared hosting: one customer's subdomain is not another's site.
-        assert_eq!(site_of_url("https://d111.cloudfront.net/a").as_deref(), Some("d111.cloudfront.net"));
-        assert_ne!(site_of_url("https://d111.cloudfront.net/a"), site_of_url("https://d222.cloudfront.net/a"));
         let map = std::collections::BTreeMap::from([
             ("Authorization".to_string(), "Bearer t".to_string()),
             ("x-token".to_string(), "1".to_string()),
@@ -11061,12 +10811,6 @@ mod tests {
         assert_eq!(ytdlp_format_with("720p", false), "b[height<=720]/b");
         assert_eq!(ytdlp_format_with("", true), "bv*+ba[ext=m4a]/bv*+ba/b");
         assert_eq!(ytdlp_format_with("", false), "b");
-        // Whatever this machine has, the string is one of the two strategies.
-        let live = ytdlp_format("720p");
-        assert!(
-            live.starts_with("bv*[height<=720]+ba[ext=m4a]") || live == "b[height<=720]/b",
-            "{live}"
-        );
         // No cap: higher always wins.
         assert!(better_stream(&None, 360, None));
         assert!(better_stream(&Some((360, String::new())), 720, None));
@@ -11813,16 +11557,6 @@ mod browser_capture_tests {
         assert!(h.contains(r#"opaque="5ccc069c403ebaf9f0171e9517f40e41""#));
         assert!(DigestAuth::parse("Basic realm=x").is_none());
         assert!(DigestAuth::parse(r#"Digest realm="r", nonce="n", algorithm=SHA-256"#).is_none());
-    }
-
-    #[test]
-    fn youtube_lists_are_told_apart_from_videos() {
-        assert!(is_youtube_list("https://www.youtube.com/playlist?list=PL123"));
-        assert!(is_youtube_list("https://www.youtube.com/@SomeChannel/videos"));
-        assert!(is_youtube_list("https://youtube.com/channel/UC123"));
-        assert!(!is_youtube_list("https://www.youtube.com/watch?v=abc&list=PL123"));
-        assert!(!is_youtube_list("https://www.youtube.com/watch?v=abc"));
-        assert!(!is_youtube_list("https://example.com/@user"));
     }
 
     #[test]

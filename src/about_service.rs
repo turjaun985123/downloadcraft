@@ -61,7 +61,6 @@ pub(crate) struct Release {
     pub tag: String,
     pub url: String,
     pub highlights: Vec<String>,
-    pub newer: bool,
 }
 
 fn read_json(name: &str) -> Option<serde_json::Value> {
@@ -89,7 +88,6 @@ pub(crate) fn read_release() -> Release {
             .and_then(|item| item.as_array())
             .map(|items| items.iter().filter_map(|item| item.as_str().map(String::from)).collect())
             .unwrap_or_default(),
-        newer: value.get("newer").and_then(|item| item.as_bool()).unwrap_or(false),
     }
 }
 

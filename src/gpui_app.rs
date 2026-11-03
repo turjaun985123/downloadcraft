@@ -2494,7 +2494,7 @@ impl Render for MainView {
                     let status = item.status.label();
                     let progress = format!("{:.0}%", item.progress() * 100.0);
                     let speed = if item.status.is_active() && item.speed_bps > 0.0 {
-                        format!("{} / s", model::format_bytes(item.speed_bps as u64))
+                        model::format_speed(item.speed_bps)
                     } else {
                         String::new()
                     };
@@ -2509,10 +2509,13 @@ impl Render for MainView {
                         Status::Failed(_) => "Retry",
                         Status::Queued | Status::Paused => "Resume",
                     };
+                    let detail_label = if matches!(&item.status, Status::Completed) { "Complete" } else { "Progress" };
+                    let complete_details = matches!(&item.status, Status::Completed);
                     let completed_path = item.dest_path();
                     let toggle_manager = row_manager.clone();
                     let remove_manager = row_manager.clone();
                     let select_manager = row_manager.clone();
+                    let detail_manager = row_manager.clone();
                     let selected = item.selected;
                     rendered.push(
                         div()
@@ -2544,6 +2547,15 @@ impl Render for MainView {
                                 } else {
                                     update_manager(&toggle_manager, app, |manager| manager.toggle(id));
                                 }
+                                window.refresh();
+                            }))
+                            .child(action_button(detail_label, format!("details-{id}"), move |window, app| {
+                                let request = if complete_details {
+                                    ManagedWindowRequest::Complete { id }
+                                } else {
+                                    ManagedWindowRequest::Progress { id }
+                                };
+                                open_managed_secondary(&detail_manager, app, request);
                                 window.refresh();
                             }))
                             .child(action_button("Remove", format!("remove-{id}"), move |window, app| {
@@ -2605,6 +2617,19 @@ impl Render for MainView {
                             window.refresh();
                         }
                     }))
+                    .child(action_button("Review link list", "review-link-list", {
+                        let manager = manager.clone();
+                        move |window, cx| {
+                            let path = rfd::FileDialog::new()
+                                .add_filter("URL list", &["txt", "url"])
+                                .set_title("Review download links")
+                                .pick_file();
+                            if let Some(path) = path {
+                                open_managed_secondary(&manager, cx, ManagedWindowRequest::Links { path });
+                            }
+                            window.refresh();
+                        }
+                    }))
                     .child(action_button("Start queue", "start-queue", {
                         let manager = manager.clone();
                         move |window, cx| {
@@ -2630,21 +2655,35 @@ impl Render for MainView {
                     .child(action_button("Settings", "open-settings", {
                         let manager = manager.clone();
                         move |window, cx| {
-                        open_managed_settings(&manager, cx, SettingsPane::Appearance);
+                        open_managed_secondary(&manager, cx, ManagedWindowRequest::Settings { pane: 0 });
                         window.refresh();
                     }}))
                     .child(action_button("About & updates", "open-about", {
                         let manager = manager.clone();
                         move |window, cx| {
-                        open_managed_about(&manager, cx);
+                        open_managed_secondary(&manager, cx, ManagedWindowRequest::About);
                         window.refresh();
                     }}))
                     .child(action_button("Get ready", "open-setup", {
                         let manager = manager.clone();
                         move |window, cx| {
-                        open_managed_setup(&manager, cx, false);
+                        open_managed_secondary(&manager, cx, ManagedWindowRequest::Setup { auto: false });
                         window.refresh();
-                    }})),
+                    }}))
+                    .child(action_button("Drop basket", "open-basket", {
+                        let manager = manager.clone();
+                        move |window, cx| {
+                            open_managed_secondary(&manager, cx, ManagedWindowRequest::Basket);
+                            window.refresh();
+                        }
+                    }))
+                    .child(action_button("Mini status", "open-mini", {
+                        let manager = manager.clone();
+                        move |window, cx| {
+                            open_managed_secondary(&manager, cx, ManagedWindowRequest::Mini);
+                            window.refresh();
+                        }
+                    })),
             )
             .child(
                 div()
@@ -3291,14 +3330,12 @@ impl Render for ProgressView {
                         .child(Self::info_row("Status", status.clone()))
                         .child(Self::info_row("Size", item.total_bytes.map(model::format_bytes).unwrap_or_else(|| "Unknown".into())))
                         .child(Self::info_row("Downloaded", model::format_bytes(item.downloaded_bytes)))
-                        .child(Self::info_row("Speed", if item.speed_bps > 0.0 { format!("{}/s", model::format_bytes(item.speed_bps as u64)) } else { "—".into() }))
+                        .child(Self::info_row("Speed", if item.speed_bps > 0.0 { model::format_speed(item.speed_bps) } else { "—".into() }))
                         .child(Self::info_row("Resolution", if !snapshot.resolution.is_empty() { snapshot.resolution.clone() } else { item.resolution.clone() }))
                         .child(Self::info_row("Resume support", if item.resumable || snapshot.resumable { "Yes".into() } else { "No".into() }));
-                    if let Some(total) = item.total_bytes {
-                        if item.speed_bps > 1.0 {
-                            let seconds = total.saturating_sub(item.downloaded_bytes) as f64 / item.speed_bps;
-                            body = body.child(Self::info_row("Remaining time", format!("{} s", seconds as u64)));
-                        }
+                    let eta = model::format_eta(item);
+                    if eta != "-" {
+                        body = body.child(Self::info_row("Remaining time", eta));
                     }
                     if let Status::Failed(error) = &item.status {
                         body = body.child(div().p_2().text_sm().text_color(rgb(0xc0392b)).child(error.clone()));
@@ -3309,7 +3346,7 @@ impl Render for ProgressView {
                     body = body
                         .child(Self::info_row("Connections", format!("up to {}", item.connections)))
                         .child(Self::info_row("Active parts", active_parts.to_string()))
-                        .child(Self::info_row("Current speed", if item.speed_bps > 0.0 { format!("{}/s", model::format_bytes(item.speed_bps as u64)) } else { "—".into() }))
+                        .child(Self::info_row("Current speed", if item.speed_bps > 0.0 { model::format_speed(item.speed_bps) } else { "—".into() }))
                         .child(Self::info_row("Transferred", model::format_bytes(item.downloaded_bytes)));
                 }
                 ProgressTab::Settings => {
