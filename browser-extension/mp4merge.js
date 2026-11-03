@@ -31,6 +31,14 @@
   };
   const put64 = (b, i, v) => { put32(b, i, Math.floor(v / 4294967296)); put32(b, i + 4, v % 4294967296); };
   const typeAt = (b, i) => { need(b, i, 4); return String.fromCharCode(b[i], b[i + 1], b[i + 2], b[i + 3]); };
+  const needBox = (b, box, i, n) => {
+    need(b, i, n);
+    if (i < box.body || i > box.end - n) throw new Error(`mp4: truncated ${box.type} field`);
+  };
+  const boxByte = (b, box, i) => { needBox(b, box, i, 1); return b[i]; };
+  const boxU32 = (b, box, i) => { needBox(b, box, i, 4); return u32(b, i); };
+  const boxU64 = (b, box, i) => { needBox(b, box, i, 8); return u64(b, i); };
+  const boxTypeAt = (b, box, i) => { needBox(b, box, i, 4); return typeAt(b, i); };
 
   // Child boxes of [start, end): {type, start, end, body} (body = payload start).
   function boxes(b, start, end) {
@@ -70,9 +78,9 @@
     if (!traks.length) throw new Error("mp4: no track");
     const trak = traks[0];
     const mdhd = path(b, trak, ["mdia", "mdhd"]);
-    const timescale = mdhd ? (byteAt(b, mdhd.body) === 1 ? u32(b, mdhd.body + 20) : u32(b, mdhd.body + 12)) : 0;
+    const timescale = mdhd ? (boxByte(b, mdhd, mdhd.body) === 1 ? boxU32(b, mdhd, mdhd.body + 20) : boxU32(b, mdhd, mdhd.body + 12)) : 0;
     const hdlr = path(b, trak, ["mdia", "hdlr"]);
-    const handler = hdlr ? typeAt(b, hdlr.body + 8) : "";
+    const handler = hdlr ? boxTypeAt(b, hdlr, hdlr.body + 8) : "";
     const mvex = child(b, moov, "mvex");
     // Fragments: each moof plus the mdat(s) after it, up to the next moof.
     const frags = [];
@@ -83,7 +91,7 @@
         if (top[j].type === "mdat") end = top[j].end;
       }
       const tfdt = path(b, top[k], ["traf", "tfdt"]);
-      const time = tfdt ? (byteAt(b, tfdt.body) === 1 ? u64(b, tfdt.body + 4) : u32(b, tfdt.body + 4)) : 0;
+      const time = tfdt ? (boxByte(b, tfdt, tfdt.body) === 1 ? boxU64(b, tfdt, tfdt.body + 4) : boxU32(b, tfdt, tfdt.body + 4)) : 0;
       frags.push({ start: top[k].start, end, moof: top[k], time });
     }
     return { b, ftyp, moov, trak, timescale, handler, mvex, frags, mdats: top.filter((x) => x.type === "mdat"),
@@ -161,7 +169,7 @@
     const b = p.b;
     const trex = p.mvex && boxes(b, p.mvex.body, p.mvex.end).find((x) => x.type === "trex");
     const dflt = trex
-      ? { dur: u32(b, trex.body + 12), size: u32(b, trex.body + 16), flags: u32(b, trex.body + 20) }
+      ? { dur: boxU32(b, trex, trex.body + 12), size: boxU32(b, trex, trex.body + 16), flags: boxU32(b, trex, trex.body + 20) }
       : { dur: 0, size: 0, flags: 0 };
     const samples = [];
     const chunks = [];
@@ -170,39 +178,46 @@
       for (const traf of boxes(b, f.moof.body, f.moof.end).filter((x) => x.type === "traf")) {
         const tfhd = child(b, traf, "tfhd");
         if (!tfhd) continue;
-        const tf = u32(b, tfhd.body) & 0xffffff;
+        const tf = boxU32(b, tfhd, tfhd.body) & 0xffffff;
         let at = tfhd.body + 8;
         let base = f.moof.start;
-        if (tf & 0x1) { base = u64(b, at); at += 8; }
-        if (tf & 0x2) at += 4;
+        if (tf & 0x1) { base = boxU64(b, tfhd, at); at += 8; }
+        if (tf & 0x2) { needBox(b, tfhd, at, 4); at += 4; }
         let tDur = dflt.dur, tSize = dflt.size, tFlags = dflt.flags;
-        if (tf & 0x8) { tDur = u32(b, at); at += 4; }
-        if (tf & 0x10) { tSize = u32(b, at); at += 4; }
-        if (tf & 0x20) { tFlags = u32(b, at); at += 4; }
+        if (tf & 0x8) { tDur = boxU32(b, tfhd, at); at += 4; }
+        if (tf & 0x10) { tSize = boxU32(b, tfhd, at); at += 4; }
+        if (tf & 0x20) { tFlags = boxU32(b, tfhd, at); at += 4; }
         const tfdt = child(b, traf, "tfdt");
         if (tfdt) {
-          const start = byteAt(b, tfdt.body) === 1 ? u64(b, tfdt.body + 4) : u32(b, tfdt.body + 4);
+          const start = boxByte(b, tfdt, tfdt.body) === 1 ? boxU64(b, tfdt, tfdt.body + 4) : boxU32(b, tfdt, tfdt.body + 4);
           if (start > time && samples.length) samples[samples.length - 1].dur += start - time;
           time = Math.max(time, start);
         }
         let ptr = base;
         for (const trun of boxes(b, traf.body, traf.end).filter((x) => x.type === "trun")) {
-          const version = byteAt(b, trun.body);
-          const rf = u32(b, trun.body) & 0xffffff;
-          const n = u32(b, trun.body + 4);
+          const version = boxByte(b, trun, trun.body);
+          const rf = boxU32(b, trun, trun.body) & 0xffffff;
+          const n = boxU32(b, trun, trun.body + 4);
           let q = trun.body + 8;
-          if (rf & 0x1) { ptr = base + s32(b, q); q += 4; }
+          if (rf & 0x1) { needBox(b, trun, q, 4); ptr = base + s32(b, q); q += 4; }
           let first = null;
-          if (rf & 0x4) { first = u32(b, q); q += 4; }
+          if (rf & 0x4) { first = boxU32(b, trun, q); q += 4; }
+          const fieldsPerSample = Number(Boolean(rf & 0x100)) + Number(Boolean(rf & 0x200))
+            + Number(Boolean(rf & 0x400)) + Number(Boolean(rf & 0x800));
+          if (fieldsPerSample && n > Math.floor((trun.end - q) / (fieldsPerSample * 4))) {
+            throw new Error("mp4: truncated trun sample table");
+          }
           const chunk = { count: 0, bytes: 0, t: p.timescale ? time / p.timescale : 0, from: samples.length };
           for (let k = 0; k < n; k++) {
             let dur = tDur, size = tSize, flags = tFlags, cts = 0;
-            if (rf & 0x100) { dur = u32(b, q); q += 4; }
-            if (rf & 0x200) { size = u32(b, q); q += 4; }
-            if (rf & 0x400) { flags = u32(b, q); q += 4; }
-            if (rf & 0x800) { cts = version ? s32(b, q) : u32(b, q); q += 4; }
+            if (rf & 0x100) { dur = boxU32(b, trun, q); q += 4; }
+            if (rf & 0x200) { size = boxU32(b, trun, q); q += 4; }
+            if (rf & 0x400) { flags = boxU32(b, trun, q); q += 4; }
+            if (rf & 0x800) { needBox(b, trun, q, 4); cts = version ? s32(b, q) : boxU32(b, trun, q); q += 4; }
             if (k === 0 && first !== null) flags = first;
-            if (ptr + size > b.length) throw new Error("mp4: sample outside the file");
+            if (!Number.isSafeInteger(ptr) || !Number.isSafeInteger(size) || ptr < 0 || size < 0 || ptr > b.length - size) {
+              throw new Error("mp4: sample outside the file");
+            }
             samples.push({ off: ptr, size, dur, cts, sync: !(flags & 0x10000) });
             ptr += size;
             time += dur;

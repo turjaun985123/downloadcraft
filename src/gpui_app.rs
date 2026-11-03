@@ -1604,7 +1604,7 @@ impl MainView {
                 } else {
                     let runtime = self.manager.read(cx).runtime.clone();
                     if let Some(view) = crate::gpui_confirm::gpui_confirm_view(requested, runtime, self.capture_focus.clone()) {
-                    use gpui::{WindowBackgroundAppearance, WindowDecorations, WindowKind};
+                    use gpui::WindowKind;
                     let bounds = Bounds::centered(None, size(px(600.0), px(420.0)), cx);
                     if let Some(window) = open_managed_window(
                         &self.manager,
@@ -1614,10 +1614,8 @@ impl MainView {
                             window_bounds: Some(WindowBounds::Windowed(bounds)),
                             titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Add download")), ..Default::default() }),
                             kind: WindowKind::PopUp,
-                            is_resizable: false,
+                            is_resizable: true,
                             is_movable: true,
-                            window_decorations: Some(WindowDecorations::Client),
-                            window_background: WindowBackgroundAppearance::Transparent,
                             ..Default::default()
                         },
                         move |_, cx| cx.new(|_| view),
