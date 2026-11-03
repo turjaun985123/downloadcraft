@@ -124,8 +124,6 @@ enum Fail {
     Retry { msg: String, progressed: bool },
     Throttled { status: u16, retry_after: Option<Duration> },
     Refused { status: u16, url: String },
-    /// The server ignores ranges and another connection carries on alone.
-    RangeIgnored,
 }
 
 struct Run {
@@ -836,7 +834,6 @@ async fn worker(run: Arc<Run>, w: usize) {
                 run.set_fatal(e);
                 break;
             }
-            Err(Fail::RangeIgnored) => break,
             Err(Fail::Retry { msg, progressed }) => {
                 // Nothing came through while other connections are working
                 // (or just were): that is the server's connection limit, not
@@ -963,7 +960,6 @@ async fn fetch(
     let ctype = text(reqwest::header::CONTENT_TYPE);
     let disposition = text(reqwest::header::CONTENT_DISPOSITION);
     let partial = status == 206;
-    let mut skip = 0u64;
     let expected: Option<u64>;
     if partial {
         match text(reqwest::header::CONTENT_RANGE).as_deref().and_then(parse_content_range) {
@@ -1000,10 +996,18 @@ async fn fetch(
             }
         }
     } else {
-        // 200: the server ignored our Range.
+        // 200: the server ignored our Range. A non-zero segment cannot be
+        // safely stitched from this response: without a valid 206/Content-Range
+        // we cannot prove its bytes belong at `pos`. Abort the partial so the
+        // outer retry starts cleanly with one full-file request.
         expected = resp.content_length();
         let multi = lock(&run.map).segments().len() > 1;
-        if pos > 0 || multi {
+        if pos > 0 {
+            return Err(Fail::Fatal(Error::FileChanged(
+                "the server ignored a non-zero byte range".into(),
+            )));
+        }
+        if multi {
             run.go_single();
         }
         // Nothing is on disk yet: let this one stream carry the whole file
@@ -1012,12 +1016,6 @@ async fn fetch(
             lock(&run.map).absorb(id);
         }
         run.learn(expected, false)?;
-        if pos > 0 {
-            if run.live.load(Ordering::SeqCst) > 1 {
-                return Err(Fail::RangeIgnored);
-            }
-            skip = pos;
-        }
     }
     run.check_validators(etag, lm)?;
     stat.streaming.store(true, Ordering::SeqCst);
@@ -1087,14 +1085,6 @@ async fn fetch(
         };
         body_bytes += chunk.len() as u64;
         let mut data = &chunk[..];
-        if skip > 0 {
-            let cut = (skip as usize).min(data.len());
-            data = &data[cut..];
-            skip -= cut as u64;
-            if data.is_empty() {
-                continue;
-            }
-        }
         let acc = lock(&run.map).take(id, w, data.len() as u64) as usize;
         if acc > 0 {
             buf.extend_from_slice(&data[..acc]);
