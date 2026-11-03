@@ -614,13 +614,17 @@ pub(crate) mod tests {
     fn a_lying_directory_size_is_refused_before_it_is_fetched() {
         let z = make_zip(&[("a.txt", b"hello")]);
         let mut tail = z[z.len() - 22..].to_vec();
-        // size field of the EOCD -> 4 GiB
-        tail[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        // Claim a 64-byte directory while the caller's configured cap is 32.
+        tail[12..16].copy_from_slice(&64u32.to_le_bytes());
+        let limits = ZipLimits {
+            max_directory_size: 32,
+            ..ZipLimits::default()
+        };
         let err = match parse(
             &tail,
             (z.len() - 22) as u64,
-            u32::MAX as u64 + 1,
-            &ZipLimits::default(),
+            z.len() as u64,
+            &limits,
         ) {
             Err(err) => err,
             Ok(_) => panic!("directory size over the configured limit was accepted"),
