@@ -5,7 +5,7 @@ use crate::confirm_core::{build_confirm_app, ConfirmApp, NOT_RUNNING, START_WAIT
 use crate::engine::{self};
 use crate::model::{category_of, filename_from_url, is_download_url};
 use gpui::prelude::*;
-use gpui::{div, px, rgb, size, Application, Bounds, FocusHandle, SharedString, Timer, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions};
+use gpui::{div, px, rgb, size, Application, Bounds, FocusHandle, SharedString, Timer, TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions};
 use std::time::Duration;
 
 pub(crate) struct GpuiConfirmView {
@@ -249,9 +249,11 @@ pub fn run_gpui() {
                 ..Default::default()
             }),
             kind: WindowKind::PopUp,
-            is_resizable: false, is_movable: true,
-            window_decorations: Some(WindowDecorations::Client),
-            window_background: WindowBackgroundAppearance::Transparent, ..Default::default()
+            // Keep server-side decorations so the window manager supplies its
+            // normal title bar, move handle, and caption buttons.
+            is_resizable: true,
+            is_movable: true,
+            ..Default::default()
         }, move |_, cx| {
             let (app, runtime) = state_for_window.lock().unwrap_or_else(|e| e.into_inner()).take().expect("confirmation state");
             let _ = runtime;

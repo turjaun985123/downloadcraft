@@ -239,13 +239,18 @@ impl DownloadManagerStore {
 
         // Keep additions made by the extension or companion processes since
         // this window last refreshed. IDs explicitly removed here stay gone.
-        if let Ok(disk) = model::read_queue_items(&path) {
-            for item in disk {
-                if !self.removed_ids.contains(&item.id)
-                    && !self.items.iter().any(|current| current.id == item.id)
-                {
-                    self.items.push(item);
-                }
+        let disk = match model::read_queue_items(&path) {
+            Ok(items) => items,
+            Err(error) => {
+                self.message = format!("Could not read queue; refusing to overwrite it: {error}");
+                return false;
+            }
+        };
+        for item in disk {
+            if !self.removed_ids.contains(&item.id)
+                && !self.items.iter().any(|current| current.id == item.id)
+            {
+                self.items.push(item);
             }
         }
 
@@ -1604,7 +1609,7 @@ impl MainView {
                 } else {
                     let runtime = self.manager.read(cx).runtime.clone();
                     if let Some(view) = crate::gpui_confirm::gpui_confirm_view(requested, runtime, self.capture_focus.clone()) {
-                    use gpui::{WindowBackgroundAppearance, WindowDecorations, WindowKind};
+                    use gpui::WindowKind;
                     let bounds = Bounds::centered(None, size(px(600.0), px(420.0)), cx);
                     if let Some(window) = open_managed_window(
                         &self.manager,
@@ -1614,10 +1619,8 @@ impl MainView {
                             window_bounds: Some(WindowBounds::Windowed(bounds)),
                             titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Add download")), ..Default::default() }),
                             kind: WindowKind::PopUp,
-                            is_resizable: false,
+                            is_resizable: true,
                             is_movable: true,
-                            window_decorations: Some(WindowDecorations::Client),
-                            window_background: WindowBackgroundAppearance::Transparent,
                             ..Default::default()
                         },
                         move |_, cx| cx.new(|_| view),
@@ -2515,9 +2518,9 @@ impl Render for MainView {
                         String::new()
                     };
                     let details = if let Some(total) = item.total_bytes {
-                        format!("{} / {} · {} · {} · {}", model::format_bytes(item.downloaded_bytes), model::format_bytes(total), progress, speed, status)
+                        format!("{} / {}  ·  {}  ·  {}  ·  {}", model::format_bytes(item.downloaded_bytes), model::format_bytes(total), progress, speed, status)
                     } else {
-                        format!("{} · {} · {} · {}", model::format_bytes(item.downloaded_bytes), progress, speed, status)
+                        format!("{}  ·  {}  ·  {}  ·  {}", model::format_bytes(item.downloaded_bytes), progress, speed, status)
                     };
                     let action_label = match &item.status {
                         Status::Downloading => "Pause",
@@ -2539,12 +2542,13 @@ impl Render for MainView {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .gap_4()
+                            .gap_2()
                             .w_full()
-                            .p_3()
-                            .bg(rgb(card_color()))
-                            .rounded_md()
-                            .child(action_button(if selected { "☑" } else { "☐" }, format!("select-{id}"), move |window, app| {
+                            .h(px(48.0))
+                            .px_2()
+                            .border_b_1()
+                            .border_color(rgb(button_color()))
+                            .child(row_action_button(if selected { "☑" } else { "☐" }, format!("select-{id}"), move |window, app| {
                                 update_manager(&select_manager, app, |manager| manager.toggle_selection(id));
                                 window.refresh();
                             }))
@@ -2554,10 +2558,11 @@ impl Render for MainView {
                                     .flex_col()
                                     .gap_1()
                                     .flex_1()
-                                    .child(item.filename)
-                                    .child(div().text_sm().text_color(rgb(muted_color())).child(details)),
+                                    .min_w_0()
+                                    .child(div().text_sm().child(item.filename))
+                                    .child(div().text_xs().font_family("monospace").text_color(rgb(muted_color())).child(details)),
                             )
-                            .child(action_button(action_label, format!("toggle-{id}"), move |window, app| {
+                            .child(row_action_button(action_label, format!("toggle-{id}"), move |window, app| {
                                 if action_label == "Open file" {
                                     crate::platform::open(&completed_path, false);
                                 } else {
@@ -2565,7 +2570,7 @@ impl Render for MainView {
                                 }
                                 window.refresh();
                             }))
-                            .child(action_button(detail_label, format!("details-{id}"), move |window, app| {
+                            .child(row_action_button(detail_label, format!("details-{id}"), move |window, app| {
                                 let request = if complete_details {
                                     ManagedWindowRequest::Complete { id }
                                 } else {
@@ -2574,7 +2579,7 @@ impl Render for MainView {
                                 open_managed_secondary(&detail_manager, app, request);
                                 window.refresh();
                             }))
-                            .child(action_button("Remove", format!("remove-{id}"), move |window, app| {
+                            .child(row_action_button("Remove", format!("remove-{id}"), move |window, app| {
                                 update_manager(&remove_manager, app, |manager| manager.remove(id));
                                 window.refresh();
                             })),
@@ -2740,6 +2745,26 @@ fn action_button(
         .py_2()
         .bg(rgb(button_color()))
         .hover(|style| style.bg(rgb(button_hover_color())))
+        .rounded_sm()
+        .cursor_pointer()
+        .child(label)
+        .on_click(move |_, window, cx| callback(window, cx))
+}
+
+fn row_action_button(
+    label: impl Into<SharedString>,
+    id: impl Into<SharedString>,
+    callback: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let label: SharedString = label.into();
+    div()
+        .id(id.into())
+        .flex_none()
+        .px_2()
+        .py_1()
+        .text_xs()
+        .text_color(rgb(muted_color()))
+        .hover(|style| style.bg(rgb(button_hover_color())).text_color(rgb(foreground_color())))
         .rounded_sm()
         .cursor_pointer()
         .child(label)

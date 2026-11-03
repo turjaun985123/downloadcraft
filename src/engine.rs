@@ -1663,7 +1663,7 @@ pub fn sanitize_filename(s: &str) -> String {
     let mut out: String = s
         .chars()
         .map(|c| {
-            if "<>:\"/\\|?*".contains(c) || (c as u32) < 32 {
+            if "<>:\"/\\|?*".contains(c) || c.is_control() {
                 '_'
             } else {
                 c
@@ -1674,6 +1674,22 @@ pub fn sanitize_filename(s: &str) -> String {
     out = out.trim().trim_matches('.').to_string();
     if out.is_empty() {
         out = "download.bin".to_string();
+    }
+    // Windows reserves device names even when an extension is present
+    // (for example, `CON.txt`). Prefix these names on every platform so a
+    // queue created on Linux remains usable if moved to Windows.
+    let device_stem = out.split('.').next().unwrap_or_default().trim_end_matches([' ', '.']);
+    let upper_stem = device_stem.to_ascii_uppercase();
+    let numbered_device = |prefix: &str| {
+        upper_stem
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
+    };
+    if matches!(upper_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || numbered_device("COM")
+        || numbered_device("LPT")
+    {
+        out.insert(0, '_');
     }
     if out.len() > 120 {
         // Keep the extension, and a closing quality tag (" [1080p]") with it:
