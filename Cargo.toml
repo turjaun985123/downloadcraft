@@ -20,6 +20,9 @@ members = [".", "crates/downloadcraft-engine"]
 # crate otherwise unchanged until GPUI updates its dependency chain.
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
+# stacksafe-macro 0.1.4 depends on the unmaintained proc-macro-error2 crate.
+# Keep the upstream macro implementation while using syn's stable diagnostics.
+stacksafe-macro = { path = "vendor/stacksafe-macro" }
 
 [features]
 default = ["gpui-ui"]
