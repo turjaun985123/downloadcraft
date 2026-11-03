@@ -461,8 +461,9 @@ fn zip_extract(path: &Path, b: &mut Budget) -> Result<(), Error> {
             continue;
         }
         b.declared(entry.size())?;
+        let size = entry.size();
         if let Some(target) = b.target(&name)? {
-            b.write(&target, &mut entry, entry.size())?;
+            b.write(&target, &mut entry, size)?;
         }
     }
     Ok(())
@@ -521,15 +522,23 @@ fn rar_extract(path: &Path, b: &mut Budget) -> Result<(), Error> {
         return Err(Error::Password);
     }
     while let Some(header) = arc.read_header().map_err(broken)? {
-        let entry = header.entry();
-        if entry.is_encrypted() {
+        let (is_encrypted, name, is_link, is_directory, size, is_split) = {
+            let entry = header.entry();
+            (
+                entry.is_encrypted(),
+                entry.filename.to_string_lossy().into_owned(),
+                entry.file_attr & 0o170000 == 0o120000,
+                entry.is_directory(),
+                entry.unpacked_size,
+                entry.is_split(),
+            )
+        };
+        if is_encrypted {
             return Err(Error::Password);
         }
-        let name = entry.filename.to_string_lossy().into_owned();
         // Unix RAR stores the mode in the attribute field; a symlink entry
         // is refused instead of being materialized.
-        let is_link = entry.file_attr & 0o170000 == 0o120000;
-        arc = if entry.is_directory() {
+        arc = if is_directory {
             b.dir(&name)?;
             header.skip().map_err(broken)?
         } else {
@@ -538,7 +547,6 @@ fn rar_extract(path: &Path, b: &mut Budget) -> Result<(), Error> {
                 b.out.refused += 1;
                 header.skip().map_err(broken)?
             } else {
-                let size = entry.unpacked_size;
                 b.declared(size)?;
                 match b.target(&name)? {
                     Some(target) => {
@@ -568,7 +576,7 @@ fn rar_extract(path: &Path, b: &mut Budget) -> Result<(), Error> {
                         // For a split entry `unpacked_size` describes this
                         // part, not the joined file; the total below still
                         // bounds what can reach the disk.
-                        if !entry.is_split() && actual != size {
+                        if !is_split && actual != size {
                             let _ = std::fs::remove_file(&tmp);
                             return Err(Error::Broken(format!(
                                 "{name} unpacked to {actual} bytes, but its header says {size}"

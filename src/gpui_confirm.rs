@@ -5,7 +5,7 @@ use crate::confirm_core::{build_confirm_app, ConfirmApp, NOT_RUNNING, START_WAIT
 use crate::engine::{self};
 use crate::model::{category_of, filename_from_url, is_download_url};
 use gpui::prelude::*;
-use gpui::{div, px, rgb, size, Application, Bounds, FocusHandle, SharedString, Timer, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions};
+use gpui::{div, px, rgb, size, Application, Bounds, FocusHandle, SharedString, Timer, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions};
 use std::time::Duration;
 
 pub(crate) struct GpuiConfirmView {
@@ -246,7 +246,11 @@ pub fn run_gpui() {
         let bounds = Bounds::centered(None, size(px(600.0), px(420.0)), cx);
         let window = cx.open_window(WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            title: Some(SharedString::from("Add download")), kind: WindowKind::PopUp,
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from("Add download")),
+                ..Default::default()
+            }),
+            kind: WindowKind::PopUp,
             is_resizable: false, is_movable: true,
             window_decorations: Some(WindowDecorations::Client),
             window_background: WindowBackgroundAppearance::Transparent, ..Default::default()
@@ -258,7 +262,7 @@ pub fn run_gpui() {
         let refresh = window.clone();
         cx.spawn(async move |mut cx| loop {
             Timer::after(Duration::from_millis(200)).await;
-            if refresh.update(&mut cx, |view, window, cx| { view.tick(); if view.is_done() { window.remove_window(); } else { cx.notify(); } }).is_err() { break; }
+            if refresh.update(cx, |view, window, cx| { view.tick(); if view.is_done() { window.remove_window(); } else { cx.notify(); } }).is_err() { break; }
         }).detach();
         cx.activate(true);
     });

@@ -853,7 +853,8 @@ impl DownloadManagerStore {
             changed = true;
         }
         self.process_commands();
-        changed |= self.apply_update_events(self.updates.poll(self.tasks.len()));
+        let update_events = self.updates.poll(self.tasks.len());
+        changed |= self.apply_update_events(update_events);
         changed |= old_message != self.message || old_filter != self.filter;
         self.speed_limit_live.store(
             model::ui_pref_u64("speed_limit_kbps", 0).saturating_mul(1024),
@@ -1172,7 +1173,7 @@ impl Render for LinksView {
             let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             (state.batch.title.clone(), state.batch.page_url.clone(), state.batch.rows.clone(), state.notice.clone())
         };
-        let mut list = div().flex().flex_col().gap_1().overflow_scroll();
+        let mut list = div().id("links-batch-list").flex().flex_col().gap_1().overflow_scroll();
         for (index, row) in rows.iter().enumerate() {
             let selected = row.checked;
             let state = self.state.clone();
@@ -1280,7 +1281,7 @@ impl Render for BasketView {
             (state.items.clone(), state.notice.clone())
         };
         let state = self.state.clone();
-        let mut rows = div().flex().flex_col().gap_1().overflow_scroll();
+        let mut rows = div().id("basket-queue-list").flex().flex_col().gap_1().overflow_scroll();
         let mut recent = items.iter().rev().take(12).cloned().collect::<Vec<_>>();
         recent.reverse();
         for item in recent.into_iter().rev() {
@@ -1419,6 +1420,7 @@ impl Render for AboutView {
         let phase = state.phase.as_str();
         let title = state.tag.trim_start_matches('v');
         let manager = div()
+            .id("update-window-content")
             .size_full()
             .flex()
             .flex_col()
@@ -1594,7 +1596,7 @@ impl MainView {
                         key.clone(),
                         WindowOptions {
                             window_bounds: Some(WindowBounds::Windowed(bounds)),
-                            title: Some(SharedString::from("Add download")),
+                            titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Add download")), ..Default::default() }),
                             kind: WindowKind::PopUp,
                             is_resizable: false,
                             is_movable: true,
@@ -1753,7 +1755,7 @@ fn open_managed_about(manager: &Entity<DownloadManagerStore>, cx: &mut App) {
         "about".into(),
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            title: Some(SharedString::from("About Download Craft")),
+            titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("About Download Craft")), ..Default::default() }),
             ..Default::default()
         },
         move |_, cx| cx.new(|_| initial),
@@ -1761,7 +1763,7 @@ fn open_managed_about(manager: &Entity<DownloadManagerStore>, cx: &mut App) {
     let refresh_window = window;
     cx.spawn(async move |mut cx| loop {
         Timer::after(Duration::from_millis(400)).await;
-        if refresh_window.update(&mut cx, |view, native_window, cx| {
+        if refresh_window.update(cx, |view, native_window, cx| {
             view.refresh();
             cx.notify();
             native_window.refresh();
@@ -1783,7 +1785,7 @@ fn open_managed_settings(manager: &Entity<DownloadManagerStore>, cx: &mut App, p
         "settings".into(),
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            title: Some(SharedString::from("Download Craft Settings")),
+            titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Download Craft Settings")), ..Default::default() }),
             ..Default::default()
         },
         move |_, cx| {
@@ -1799,7 +1801,7 @@ fn open_managed_settings(manager: &Entity<DownloadManagerStore>, cx: &mut App, p
     let refresh_window = window;
     cx.spawn(async move |mut cx| loop {
         Timer::after(Duration::from_millis(500)).await;
-        if refresh_window.update(&mut cx, |_view, native_window, cx| {
+        if refresh_window.update(cx, |_view, native_window, cx| {
             cx.notify();
             native_window.refresh();
         }).is_err() {
@@ -1832,7 +1834,7 @@ fn open_managed_setup(manager: &Entity<DownloadManagerStore>, cx: &mut App, auto
         "setup".into(),
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            title: Some(SharedString::from("Get ready — Download Craft")),
+            titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Get ready — Download Craft")), ..Default::default() }),
             ..Default::default()
         },
         move |_, cx| cx.new(|_| SetupView { data: data_for_view }),
@@ -1840,7 +1842,7 @@ fn open_managed_setup(manager: &Entity<DownloadManagerStore>, cx: &mut App, auto
     let refresh_window = window;
     cx.spawn(async move |mut cx| loop {
         Timer::after(Duration::from_millis(300)).await;
-        if refresh_window.update(&mut cx, |view, native_window, cx| {
+        if refresh_window.update(cx, |view, native_window, cx| {
             view.poll();
             cx.notify();
             native_window.refresh();
@@ -1906,14 +1908,14 @@ fn open_managed_progress(manager: &Entity<DownloadManagerStore>, cx: &mut App, i
         key,
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            title: Some(SharedString::from(format!("Download Craft · #{id}"))),
+            titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from(format!("Download Craft · #{id}"))), ..Default::default() }),
             ..Default::default()
         },
         move |_, cx| cx.new(|_| view),
     ) else { return };
     cx.spawn(async move |mut cx| loop {
         Timer::after(Duration::from_millis(250)).await;
-        if window.update(&mut cx, |view, native_window, cx| {
+        if window.update(cx, |view, native_window, cx| {
             view.refresh();
             let handoff = view.snapshot.item.as_ref().is_some_and(|item| {
                 !view.snapshot.live && matches!(&item.status, Status::Completed)
@@ -1940,14 +1942,14 @@ fn open_managed_complete(manager: &Entity<DownloadManagerStore>, cx: &mut App, i
         key,
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            title: Some(SharedString::from("Download complete")),
+            titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Download complete")), ..Default::default() }),
             ..Default::default()
         },
         move |_, cx| cx.new(|_| view),
     ) else { return };
     cx.spawn(async move |mut cx| loop {
         Timer::after(Duration::from_millis(500)).await;
-        if window.update(&mut cx, |_view, native_window, cx| {
+        if window.update(cx, |_view, native_window, cx| {
             cx.notify();
             native_window.refresh();
         }).is_err() { break; }
@@ -1964,14 +1966,14 @@ fn open_managed_mini(manager: &Entity<DownloadManagerStore>, cx: &mut App) {
         "mini".into(),
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            title: Some(SharedString::from("Download Craft Mini")),
+            titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Download Craft Mini")), ..Default::default() }),
             ..Default::default()
         },
         move |_, cx| cx.new(|_| initial),
     ) else { return };
     cx.spawn(async move |mut cx| loop {
         Timer::after(Duration::from_secs(1)).await;
-        if window.update(&mut cx, |view, native_window, cx| {
+        if window.update(cx, |view, native_window, cx| {
             view.refresh();
             cx.notify();
             native_window.refresh();
@@ -1993,14 +1995,14 @@ fn open_managed_basket(manager: &Entity<DownloadManagerStore>, cx: &mut App) {
         "basket".into(),
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            title: Some(SharedString::from("Drop Basket")),
+            titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Drop Basket")), ..Default::default() }),
             ..Default::default()
         },
         move |_, cx| cx.new(|_| BasketView { state: state_for_view }),
     ) else { return };
     cx.spawn(async move |mut cx| loop {
         Timer::after(Duration::from_secs(2)).await;
-        if window.update(&mut cx, |view, native_window, cx| {
+        if window.update(cx, |view, native_window, cx| {
             view.reload();
             cx.notify();
             native_window.refresh();
@@ -2031,7 +2033,7 @@ fn open_managed_links(manager: &Entity<DownloadManagerStore>, cx: &mut App, path
         key,
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            title: Some(SharedString::from(format!("Download page links ({count})"))),
+            titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from(format!("Download page links ({count})"))), ..Default::default() }),
             ..Default::default()
         },
         move |_, cx| cx.new(|_| LinksView { state: state_for_view }),
@@ -2129,7 +2131,7 @@ impl Render for MainView {
                 .border_1()
                 .border_color(rgb(if focus.is_focused(_window) { accent_color() } else { button_color() }))
                 .child(if grab_url.is_empty() { "Click here, then type or paste a page URL".to_string() } else { grab_url.clone() })
-                .on_mouse_down(cx.listener(move |_this, _, window, _| focused_input.focus(window)))
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |_this, _, window, _| focused_input.focus(window)))
                 .on_key_down(cx.listener(move |_this, event: &KeyDownEvent, window, cx| {
                     let key = event.keystroke.key.as_str();
                     let modifiers = &event.keystroke.modifiers;
@@ -2203,7 +2205,7 @@ impl Render for MainView {
                     .child(div().flex_1().p_2().bg(rgb(card_color())).rounded_sm().child(grab_exts)))
                 .child(grab_controls)
                 .child(div().text_sm().text_color(rgb(muted_color())).child(grab_notice))
-                .child(div().flex_1().min_h_0().flex().flex_col().gap_2().overflow_scroll().children(result_rows));
+                .child(div().id("grab-results").flex_1().min_h_0().flex().flex_col().gap_2().overflow_scroll().children(result_rows));
             let back_manager = manager.clone();
             let grab_sidebar = div().w(px(180.0)).flex_none().flex().flex_col().gap_2().h_full().pr_3()
                 .child(div().px_2().py_2().text_xs().font_weight(gpui::FontWeight::BOLD).text_color(rgb(muted_color())).child("DOWNLOADS"))
@@ -2241,7 +2243,7 @@ impl Render for MainView {
                 .border_1()
                 .border_color(rgb(if focus.is_focused(_window) { accent_color() } else { button_color() }))
                 .child(if site_rule_draft.is_empty() { "Enter a host, for example example.com".to_string() } else { site_rule_draft.clone() })
-                .on_mouse_down(cx.listener(move |_this, _, window, _| focused_input.focus(window)))
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |_this, _, window, _| focused_input.focus(window)))
                 .on_key_down(cx.listener(move |_this, event: &KeyDownEvent, window, cx| {
                     let key = event.keystroke.key.as_str();
                     let modifiers = &event.keystroke.modifiers;
@@ -2344,11 +2346,11 @@ impl Render for MainView {
                 .child(div().flex().gap_2().items_center().child(site_input).child(add_site))
                 .child(div().text_sm().text_color(rgb(muted_color())).child(site_rule_notice))
                 .child(div().text_lg().font_weight(gpui::FontWeight::BOLD).child("Your exclusions"))
-                .child(div().flex().flex_col().gap_2().w_full().overflow_scroll().children(host_rows))
+                .child(div().id("site-rule-hosts").flex().flex_col().gap_2().w_full().overflow_scroll().children(host_rows))
                 .child(div().text_sm().text_color(rgb(muted_color())).child(if hosts.is_empty() { "No personal exclusions" } else { "Remove a host to resume browser capture there." }))
                 .child(div().text_lg().font_weight(gpui::FontWeight::BOLD).child("Download Craft rules"))
                 .child(div().text_sm().text_color(rgb(muted_color())).child("Published rules are read-only and may update from the project."))
-                .child(div().flex().flex_col().gap_1().w_full().overflow_scroll().children(official_rows));
+                .child(div().id("official-site-rules").flex().flex_col().gap_1().w_full().overflow_scroll().children(official_rows));
             return div().size_full().flex().bg(rgb(background_color())).p_4().gap_3().child(sidebar).child(panel);
         }
         let sidebar = div()
@@ -2410,7 +2412,7 @@ impl Render for MainView {
             .border_1()
             .border_color(rgb(if search_focus.is_focused(_window) { accent_color() } else { button_color() }))
             .child(if search_query.is_empty() { "Search downloads by name, URL, or status".to_string() } else { search_query.clone() })
-            .on_mouse_down(cx.listener(move |_this, _, window, _| search_focus.focus(window)))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |_this, _, window, _| search_focus.focus(window)))
             .on_key_down(cx.listener(move |_this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 let modifiers = &event.keystroke.modifiers;
@@ -2674,7 +2676,7 @@ fn action_button(
     label: impl Into<SharedString>,
     id: impl Into<SharedString>,
     callback: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let label: SharedString = label.into();
     div()
         .id(id.into())
@@ -2730,7 +2732,7 @@ fn settings_row(
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = *self.pane.lock().unwrap_or_else(|error| error.into_inner());
         let mut rows = div().flex().flex_col().gap_2().w_full();
         match pane {
@@ -2910,7 +2912,7 @@ impl Render for SettingsView {
                     } else {
                         draft_value
                     })
-                    .on_mouse_down(cx.listener(move |_this, _, window, _| proxy_focus.focus(window)))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |_this, _, window, _| proxy_focus.focus(window)))
                     .on_key_down(cx.listener(move |_this, event: &KeyDownEvent, window, cx| {
                         let key = event.keystroke.key.as_str();
                         let modifiers = &event.keystroke.modifiers;
@@ -3105,7 +3107,7 @@ impl Render for SettingsView {
 }
 
 impl Render for SetupView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (states, busy, show_at_start, missing) = {
             let data = self.data.lock().unwrap_or_else(|error| error.into_inner());
             (data.states.clone(), data.busy, data.show_at_start, Self::missing_automatic(&data))
@@ -3113,7 +3115,7 @@ impl Render for SetupView {
         let ready = states.iter().filter(|(_, state)| state.ready()).count();
         let all = states.len();
         let data = self.data.clone();
-        let mut rows = div().flex().flex_col().gap_2().w_full().overflow_scroll();
+        let mut rows = div().id("setup-state-list").flex().flex_col().gap_2().w_full().overflow_scroll();
         for (part, state) in states {
             let detail = state.detail();
             let ready = state.ready();
@@ -3280,7 +3282,7 @@ impl Render for ProgressView {
                 item.status.label()
             }
         }).unwrap_or_else(|| "No longer in the queue".into());
-        let mut body = div().flex().flex_col().gap_1().w_full().overflow_scroll();
+        let mut body = div().id("settings-browser-body").flex().flex_col().gap_1().w_full().overflow_scroll();
 
         if let Some(item) = &item {
             match tab {
@@ -3505,7 +3507,7 @@ pub fn run(runtime: Arc<tokio::runtime::Runtime>) {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    title: Some(SharedString::from(model::APP_NAME)),
+                    titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from(model::APP_NAME)), ..Default::default() }),
                     ..Default::default()
                 },
                 move |window, cx| {
@@ -3545,7 +3547,7 @@ pub fn run(runtime: Arc<tokio::runtime::Runtime>) {
                     model::touch_heartbeat();
                     last_heartbeat = Instant::now();
                 }
-                if window.update(&mut cx, |view, native_window, cx| {
+                if window.update(cx, |view, native_window, cx| {
                     view.tick_capture_dialog(native_window, cx);
                 }).is_err() {
                     break;
@@ -3556,9 +3558,9 @@ pub fn run(runtime: Arc<tokio::runtime::Runtime>) {
                 }
                 if crate::tray::take_show_request() {
                     crate::tray::show();
-                    let _ = window.update(&mut cx, |_, window, _| window.activate_window());
+                    let _ = window.update(cx, |_, window, _| window.activate_window());
                 }
-                let _ = refresh_manager.update(&mut cx, |manager, cx| {
+                let _ = refresh_manager.update(cx, |manager, cx| {
                     if manager.refresh() {
                         cx.notify();
                     }
@@ -3590,6 +3592,7 @@ pub fn run_about() {
         helpers: Vec::new(),
         helpers_rx: Some(rx),
         auto_updates: model::ui_pref_bool("update_auto", true),
+        window_manager: None,
     };
     Application::new().run(move |cx: &mut App| {
         initialize_gpui_app(cx);
@@ -3598,7 +3601,7 @@ pub fn run_about() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    title: Some(SharedString::from("About Download Craft")),
+                    titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("About Download Craft")), ..Default::default() }),
                     ..Default::default()
                 },
                 move |_, cx| cx.new(|_| initial),
@@ -3607,7 +3610,7 @@ pub fn run_about() {
         cx.spawn(async move |mut cx| loop {
             Timer::after(Duration::from_millis(400)).await;
             if window
-                .update(&mut cx, |view, native_window, cx| {
+                .update(cx, |view, native_window, cx| {
                     view.refresh();
                     cx.notify();
                     native_window.refresh();
@@ -3653,7 +3656,7 @@ pub fn run_settings() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    title: Some(SharedString::from("Download Craft Settings")),
+                    titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Download Craft Settings")), ..Default::default() }),
                     ..Default::default()
                 },
                 move |_, cx| {
@@ -3670,7 +3673,7 @@ pub fn run_settings() {
         cx.spawn(async move |mut cx| loop {
             Timer::after(Duration::from_millis(500)).await;
             if window
-                .update(&mut cx, |_view, native_window, cx| {
+                .update(cx, |_view, native_window, cx| {
                     cx.notify();
                     native_window.refresh();
                 })
@@ -3712,7 +3715,7 @@ pub fn run_setup() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    title: Some(SharedString::from("Get ready — Download Craft")),
+                    titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Get ready — Download Craft")), ..Default::default() }),
                     ..Default::default()
                 },
                 move |_, cx| cx.new(|_| SetupView { data }),
@@ -3721,7 +3724,7 @@ pub fn run_setup() {
         cx.spawn(async move |mut cx| loop {
             Timer::after(Duration::from_millis(300)).await;
             if window
-                .update(&mut cx, |view, native_window, cx| {
+                .update(cx, |view, native_window, cx| {
                     view.poll();
                     cx.notify();
                     native_window.refresh();
@@ -3763,7 +3766,7 @@ pub fn run_progress() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    title: Some(SharedString::from(format!("Download Craft · #{id}"))),
+                    titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from(format!("Download Craft · #{id}"))), ..Default::default() }),
                     ..Default::default()
                 },
                 move |_, cx| cx.new(|_| view),
@@ -3772,7 +3775,7 @@ pub fn run_progress() {
         cx.spawn(async move |mut cx| loop {
             Timer::after(Duration::from_millis(250)).await;
             if window
-                .update(&mut cx, |view, native_window, cx| {
+                .update(cx, |view, native_window, cx| {
                     view.refresh();
                     let handoff = view.snapshot.item.as_ref().is_some_and(|item| {
                         !view.snapshot.live
@@ -3828,7 +3831,7 @@ pub fn run_complete() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    title: Some(SharedString::from("Download complete")),
+                    titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Download complete")), ..Default::default() }),
                     ..Default::default()
                 },
                 move |_, cx| cx.new(|_| view),
@@ -3837,7 +3840,7 @@ pub fn run_complete() {
         cx.spawn(async move |mut cx| loop {
             Timer::after(Duration::from_millis(500)).await;
             if window
-                .update(&mut cx, |_view, native_window, cx| {
+                .update(cx, |_view, native_window, cx| {
                     cx.notify();
                     native_window.refresh();
                 })
@@ -3865,7 +3868,7 @@ pub fn run_mini() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    title: Some(SharedString::from("Download Craft Mini")),
+                    titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Download Craft Mini")), ..Default::default() }),
                     ..Default::default()
                 },
                 move |_, cx| cx.new(|_| initial),
@@ -3874,7 +3877,7 @@ pub fn run_mini() {
         cx.spawn(async move |mut cx| loop {
             Timer::after(Duration::from_secs(1)).await;
             if window
-                .update(&mut cx, |view, native_window, cx| {
+                .update(cx, |view, native_window, cx| {
                     view.refresh();
                     cx.notify();
                     native_window.refresh();
@@ -3905,7 +3908,7 @@ pub fn run_basket() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    title: Some(SharedString::from("Drop Basket")),
+                    titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from("Drop Basket")), ..Default::default() }),
                     ..Default::default()
                 },
                 move |_, cx| cx.new(|_| BasketView { state: state_for_view }),
@@ -3914,7 +3917,7 @@ pub fn run_basket() {
         cx.spawn(async move |mut cx| loop {
             Timer::after(Duration::from_secs(2)).await;
             if window
-                .update(&mut cx, |view, native_window, cx| {
+                .update(cx, |view, native_window, cx| {
                     view.reload();
                     cx.notify();
                     native_window.refresh();
@@ -3949,7 +3952,7 @@ pub fn run_links(path: PathBuf) {
         let _window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                title: Some(SharedString::from(format!("Download page links ({count})"))),
+                titlebar: Some(gpui::TitlebarOptions { title: Some(SharedString::from(format!("Download page links ({count})"))), ..Default::default() }),
                 ..Default::default()
             },
             move |_, cx| cx.new(|_| LinksView { state: state_for_view }),

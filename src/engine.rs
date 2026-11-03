@@ -8598,7 +8598,9 @@ async fn single_stream_once(
     } else {
         req.header(reqwest::header::RANGE, format!("bytes={start_at}-"))
     };
-    let response = until_cancel(shared.as_ref(), req.send()).await?.error_for_status();
+    let response = until_cancel(shared.as_ref(), req.send())
+        .await??
+        .error_for_status();
     let resp = match response {
         Ok(r) => r,
         Err(e) => {
@@ -8606,7 +8608,7 @@ async fn single_stream_once(
             if start_at == 0 && !is_final_http_error(&mapped) {
                 // server dislikes Range (but isn't refusing us): plain GET
                 until_cancel(shared.as_ref(), opts.get(client, url).send())
-                    .await?
+                    .await??
                     .error_for_status()
                     .map_err(|e| http_status_err(url, e))?
             } else {

@@ -983,15 +983,22 @@ fn push_loop() {
         }
         first = false;
         // Page-fetch requests the app is waiting on.
+        let now = std::time::Instant::now();
+        asked.retain(|_, requested_at| now.duration_since(*requested_at) < FETCH_REQUEST_TTL);
         if let Some(dir) = page_fetch_dir() {
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
                     let Some(id) = name.strip_suffix(".req.json") else { continue };
-                    if !safe_fetch_id(id) || asked.contains(id) {
+                    if !safe_fetch_id(id) || asked.contains_key(id) {
                         continue;
                     }
-                    asked.insert(id.to_string());
+                    if asked.len() >= MAX_ASKED {
+                        if let Some(oldest) = asked.iter().min_by_key(|(_, at)| **at).map(|(key, _)| key.clone()) {
+                            asked.remove(&oldest);
+                        }
+                    }
+                    asked.insert(id.to_string(), now);
                     if let Some(req) = std::fs::read_to_string(e.path()).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
                         write_value(&serde_json::json!({
                             "type": "pageFetch", "id": id,
