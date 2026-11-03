@@ -1,4 +1,6 @@
 name: Desktop packages
+env:
+  RUSTFLAGS: "-D warnings"
 on:
   workflow_dispatch:
     inputs:
