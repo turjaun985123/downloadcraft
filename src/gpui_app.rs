@@ -2390,14 +2390,11 @@ impl Render for MainView {
                     QueueFilter::Failed => failed_count,
                 };
                 let selected = entry == filter;
-                let fill = if selected { accent_color() } else { button_color() };
                 let entry_manager = sidebar_manager.clone();
-                action_button(format!("{}  ·  {count}", entry.label()), format!("sidebar-{}", entry.label()), move |window, cx| {
+                sidebar_button(entry.label(), count, format!("sidebar-{}", entry.label()), selected, move |window, cx| {
                     update_manager(&entry_manager, cx, |manager| manager.filter = entry);
                     window.refresh();
                 })
-                .w_full()
-                .when(selected, |button| button.bg(rgb(fill)))
             }))
             .child(div().h(px(12.0)))
             .child(div().px_2().py_2().text_xs().font_weight(gpui::FontWeight::BOLD).text_color(rgb(muted_color())).child("SITE TOOLS"))
@@ -2467,34 +2464,35 @@ impl Render for MainView {
         let all_visible_selected = !visible_indices.is_empty()
             && visible_indices.iter().all(|index| state.items[*index].selected);
         let selection_manager = manager.clone();
-        let select_visible = action_button(
+        let select_visible = command_button(
             if all_visible_selected { "Clear visible" } else { "Select visible" },
             "select-visible-downloads",
+            false,
             move |window, cx| {
                 update_manager(&selection_manager, cx, |manager| manager.set_selected(&visible_ids, !all_visible_selected));
                 window.refresh();
             },
         );
         let sort_manager = manager.clone();
-        let sort_button = action_button(format!("Sort: {}", sort.label()), "sort-downloads", move |window, cx| {
+        let sort_button = command_button(format!("Sort · {}", sort.label()), "sort-downloads", false, move |window, cx| {
             update_manager(&sort_manager, cx, |manager| manager.sort = manager.sort.next());
             window.refresh();
         });
         let pause_selected_manager = manager.clone();
         let resume_selected_manager = manager.clone();
         let remove_selected_manager = manager.clone();
-        let selection_controls = div().flex().items_center().gap_2()
+        let selection_controls = div().flex().items_center().gap_1()
             .child(select_visible)
-            .child(div().text_xs().text_color(rgb(muted_color())).child(format!("{selected_count} selected · {} shown", visible_indices.len())))
-            .child(action_button("Pause selected", "pause-selected", move |window, cx| {
+            .child(div().px_2().text_xs().font_family("monospace").text_color(rgb(muted_color())).child(format!("{selected_count} selected · {} shown", visible_indices.len())))
+            .child(command_button("Pause selected", "pause-selected", false, move |window, cx| {
                 update_manager(&pause_selected_manager, cx, |manager| manager.pause_selected());
                 window.refresh();
             }).when(selected_count == 0, |button| button.opacity(0.55)))
-            .child(action_button("Resume selected", "resume-selected", move |window, cx| {
+            .child(command_button("Resume selected", "resume-selected", false, move |window, cx| {
                 update_manager(&resume_selected_manager, cx, |manager| manager.resume_selected());
                 window.refresh();
             }).when(selected_count == 0, |button| button.opacity(0.55)))
-            .child(action_button("Remove selected", "remove-selected", move |window, cx| {
+            .child(command_button("Remove selected", "remove-selected", false, move |window, cx| {
                 update_manager(&remove_selected_manager, cx, |manager| manager.remove_selected());
                 window.refresh();
             }).when(selected_count == 0, |button| button.opacity(0.55)));
@@ -2599,8 +2597,8 @@ impl Render for MainView {
             .flex_col()
             .bg(rgb(background_color()))
             .text_color(rgb(foreground_color()))
-            .p_5()
-            .gap_4()
+            .p_4()
+            .gap_3()
             .child(
                 div()
                     .flex()
@@ -2620,8 +2618,12 @@ impl Render for MainView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(action_button("Add clipboard URL", "add-clipboard", {
+                    .gap_1()
+                    .px_1()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(rgb(button_color()))
+                    .child(command_button("Paste URL", "add-clipboard", true, {
                         let manager = manager.clone();
                         move |window, cx| {
                         let mut url = String::new();
@@ -2631,14 +2633,14 @@ impl Render for MainView {
                         update_manager(&manager, cx, |manager| { manager.add_url(&url); });
                         window.refresh();
                     }}))
-                    .child(action_button("Import links", "import-links", {
+                    .child(command_button("Import", "import-links", false, {
                         let manager = manager.clone();
                         move |window, cx| {
                             update_manager(&manager, cx, |manager| manager.import_links_file());
                             window.refresh();
                         }
                     }))
-                    .child(action_button("Review link list", "review-link-list", {
+                    .child(command_button("Review list", "review-link-list", false, {
                         let manager = manager.clone();
                         move |window, cx| {
                             let path = rfd::FileDialog::new()
@@ -2651,14 +2653,14 @@ impl Render for MainView {
                             window.refresh();
                         }
                     }))
-                    .child(action_button("Start queue", "start-queue", {
+                    .child(command_button("Start queue", "start-queue", false, {
                         let manager = manager.clone();
                         move |window, cx| {
                             update_manager(&manager, cx, |manager| manager.start_queue());
                             window.refresh();
                         }
                     }))
-                    .child(action_button("Pause queue", "pause-queue", {
+                    .child(command_button("Pause queue", "pause-queue", false, {
                         let manager = manager.clone();
                         move |window, cx| {
                             update_manager(&manager, cx, |manager| manager.pause_queue());
@@ -2666,39 +2668,40 @@ impl Render for MainView {
                         }
                     })),
             )
-            .child(div().flex().items_center().gap_2().child(search_input).child(sort_button))
+            .child(div().flex().items_center().gap_1().child(search_input).child(sort_button))
             .child(selection_controls)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(action_button("Settings", "open-settings", {
+                    .gap_1()
+                    .px_1()
+                    .child(command_button("Settings", "open-settings", false, {
                         let manager = manager.clone();
                         move |window, cx| {
                         open_managed_secondary(&manager, cx, ManagedWindowRequest::Settings { pane: 0 });
                         window.refresh();
                     }}))
-                    .child(action_button("About & updates", "open-about", {
+                    .child(command_button("About", "open-about", false, {
                         let manager = manager.clone();
                         move |window, cx| {
                         open_managed_secondary(&manager, cx, ManagedWindowRequest::About);
                         window.refresh();
                     }}))
-                    .child(action_button("Get ready", "open-setup", {
+                    .child(command_button("Setup", "open-setup", false, {
                         let manager = manager.clone();
                         move |window, cx| {
                         open_managed_secondary(&manager, cx, ManagedWindowRequest::Setup { auto: false });
                         window.refresh();
                     }}))
-                    .child(action_button("Drop basket", "open-basket", {
+                    .child(command_button("Basket", "open-basket", false, {
                         let manager = manager.clone();
                         move |window, cx| {
                             open_managed_secondary(&manager, cx, ManagedWindowRequest::Basket);
                             window.refresh();
                         }
                     }))
-                    .child(action_button("Mini status", "open-mini", {
+                    .child(command_button("Mini", "open-mini", false, {
                         let manager = manager.clone();
                         move |window, cx| {
                             open_managed_secondary(&manager, cx, ManagedWindowRequest::Mini);
@@ -2751,6 +2754,56 @@ fn action_button(
         .on_click(move |_, window, cx| callback(window, cx))
 }
 
+fn command_button(
+    label: impl Into<SharedString>,
+    id: impl Into<SharedString>,
+    primary: bool,
+    callback: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let label: SharedString = label.into();
+    div()
+        .id(id.into())
+        .flex_none()
+        .px_2()
+        .py_1()
+        .text_sm()
+        .text_color(rgb(foreground_color()))
+        .when(primary, |style| style.bg(rgb(accent_color())))
+        .when(!primary, |style| style.hover(|style| style.bg(rgb(button_hover_color()))))
+        .when(primary, |style| style.hover(|style| style.bg(rgb(accent_hover_color()))))
+        .rounded_sm()
+        .cursor_pointer()
+        .child(label)
+        .on_click(move |_, window, cx| callback(window, cx))
+}
+
+fn sidebar_button(
+    label: impl Into<SharedString>,
+    count: usize,
+    id: impl Into<SharedString>,
+    selected: bool,
+    callback: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let label: SharedString = label.into();
+    div()
+        .id(id.into())
+        .flex()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .h(px(32.0))
+        .px_2()
+        .text_sm()
+        .text_color(rgb(if selected { foreground_color() } else { muted_color() }))
+        .when(selected, |style| style.bg(rgb(button_color())))
+        .when(!selected, |style| style.hover(|style| style.bg(rgb(button_hover_color())).text_color(rgb(foreground_color()))))
+        .rounded_sm()
+        .cursor_pointer()
+        .child(label)
+        .child(div().text_xs().font_family("monospace").text_color(rgb(muted_color())).child(count.to_string()))
+        .on_click(move |_, window, cx| callback(window, cx))
+}
+
 fn row_action_button(
     label: impl Into<SharedString>,
     id: impl Into<SharedString>,
@@ -2782,6 +2835,7 @@ fn muted_color() -> u32 { if light_theme() { 0x626b7a } else { 0x9aa2b8 } }
 fn button_color() -> u32 { if light_theme() { 0xe5e8ef } else { 0x292d3d } }
 fn button_hover_color() -> u32 { if light_theme() { 0xd6dbe5 } else { 0x373c50 } }
 fn accent_color() -> u32 { if light_theme() { 0x6652bd } else { 0x4b3b88 } }
+fn accent_hover_color() -> u32 { if light_theme() { 0x5844aa } else { 0x5a4a98 } }
 
 fn settings_row(
     title: impl Into<SharedString>,

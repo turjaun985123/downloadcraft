@@ -184,9 +184,9 @@ impl Render for GpuiConfirmView {
         let size_text = self.app.probe_size.or(self.app.browser_size).map(crate::model::format_bytes)
             .unwrap_or_else(|| if self.app.probing { "Checking size…".into() } else { "Size unavailable".into() });
         let focus = self.filename_focus.clone();
-        let filename = div().id("confirm-filename").track_focus(&focus).w_full().p_3()
-            .bg(rgb(0x141620)).rounded_md().border_1()
-            .border_color(rgb(if focus.is_focused(window) { 0x6252c7 } else { 0x373b4b }))
+        let filename = div().id("confirm-filename").track_focus(&focus).w_full().px_3().py_2()
+            .bg(rgb(0x111317)).rounded_sm().border_1()
+            .border_color(rgb(if focus.is_focused(window) { 0x3b82f6 } else { 0x292d34 }))
             .child(if name.is_empty() { "File name".to_string() } else { name })
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |view, _, window, _| view.filename_focus.focus(window)))
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
@@ -210,26 +210,34 @@ impl Render for GpuiConfirmView {
                 }
                 cx.notify();
             }));
-        let download = div().id("confirm-download").px_5().py_2().bg(rgb(0x6252c7)).hover(|s| s.bg(rgb(0x7565d7)))
-            .rounded_sm().cursor_pointer().child(if self.app.waiting_app.is_some() { "Starting…" } else { "Download" })
+        let download = div().id("confirm-download").px_4().py_2().bg(rgb(0x3b82f6)).hover(|s| s.bg(rgb(0x5793f8)))
+            .rounded_sm().cursor_pointer().text_sm().font_weight(gpui::FontWeight::SEMIBOLD)
+            .child(if self.app.waiting_app.is_some() { "Starting…" } else { "Download now" })
             .on_click(cx.listener(|view, _, window, cx| { view.app.commit(true); view.acknowledge_capture_if_done(); if view.app.done { window.remove_window(); } else { cx.notify(); } }));
-        let later = div().id("confirm-later").px_4().py_2().bg(rgb(0x303444)).hover(|s| s.bg(rgb(0x3a4054)))
-            .rounded_sm().cursor_pointer().child("Download later")
+        let later = div().id("confirm-later").px_3().py_2().hover(|s| s.bg(rgb(0x20242b)))
+            .rounded_sm().cursor_pointer().text_sm().text_color(rgb(0xc0c5ce)).child("Add to queue")
             .on_click(cx.listener(|view, _, window, cx| { view.app.commit(false); view.acknowledge_capture_if_done(); if view.app.done { window.remove_window(); } else { cx.notify(); } }));
-        let cancel = div().id("confirm-cancel").px_4().py_2().bg(rgb(0x303444)).hover(|s| s.bg(rgb(0x3a4054)))
-            .rounded_sm().cursor_pointer().child("Cancel")
+        let cancel = div().id("confirm-cancel").px_2().py_2().hover(|s| s.bg(rgb(0x20242b)))
+            .rounded_sm().cursor_pointer().text_sm().text_color(rgb(0x8b929e)).child("Cancel")
             .on_click(cx.listener(|view, _, window, _| { view.app.stop_prestart(None); view.app.done = true; view.acknowledge_capture_if_done(); window.remove_window(); }));
-        div().size_full().flex().items_center().justify_center().bg(rgb(0x11131b)).text_color(rgb(0xe9eaf0))
-            .child(div().w(px(560.0)).flex().flex_col().gap_3().p_5().bg(rgb(0x1b1e2a)).rounded_lg()
-                .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).child("Add download"))
-                .child(div().text_sm().text_color(rgb(0xa0a5b7)).child("File name"))
+        div().size_full().flex().items_center().justify_center().bg(rgb(0x0b0c0e)).text_color(rgb(0xf0f3f6))
+            .child(div().w(px(480.0)).flex().flex_col().gap_3().p_4().bg(rgb(0x111317)).border_1().border_color(rgb(0x21262d)).rounded_md()
+                .child(div().flex().items_center().justify_between()
+                    .child(div().flex().items_center().gap_3()
+                        .child(div().w(px(34.0)).h(px(34.0)).flex().items_center().justify_center().rounded_sm().bg(rgb(0x1c2d45)).text_color(rgb(0x78aef8)).child("↓"))
+                        .child(div().flex().flex_col().gap_1()
+                            .child(div().text_base().font_weight(gpui::FontWeight::SEMIBOLD).child("Download file"))
+                            .child(div().text_xs().text_color(rgb(0x8b929e)).font_family("monospace").child(size_text))))
+                    .child(cancel))
+                .child(div().text_xs().font_weight(gpui::FontWeight::SEMIBOLD).text_color(rgb(0x8b929e)).child("FILE NAME"))
                 .child(filename)
-                .child(div().text_sm().text_color(rgb(0xa0a5b7)).child("Save to"))
-                .child(div().w_full().p_3().bg(rgb(0x141620)).rounded_md().child(dir))
-                .child(div().text_sm().text_color(rgb(0xa0a5b7)).child(size_text))
-                .child(div().text_xs().text_color(rgb(0xa0a5b7)).child(url))
-                .child(div().text_sm().text_color(rgb(0xe8b66a)).child(notice))
-                .child(div().flex().justify_end().items_center().gap_2().child(cancel).child(later).child(download)))
+                .child(div().flex().flex_col().gap_1()
+                    .child(div().text_xs().font_weight(gpui::FontWeight::SEMIBOLD).text_color(rgb(0x8b929e)).child("SAVE TO"))
+                    .child(div().text_sm().child(dir)))
+                .when(!url.is_empty(), |card| card.child(div().text_xs().font_family("monospace").text_color(rgb(0x69717d)).child(url)))
+                .when(!notice.is_empty(), |card| card.child(div().text_xs().text_color(rgb(0xe4ad55)).child(notice)))
+                .child(div().h(px(1.0)).w_full().bg(rgb(0x21262d)))
+                .child(div().flex().justify_end().items_center().gap_2().child(later).child(download)))
     }
 }
 
