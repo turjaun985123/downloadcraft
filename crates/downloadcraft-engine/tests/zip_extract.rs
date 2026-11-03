@@ -136,11 +136,14 @@ async fn a_lying_entry_size_cannot_expand_past_its_declared_bytes() {
 async fn a_huge_directory_claim_is_refused_before_it_is_fetched() {
     let mut zip = make_zip(&[("a.txt", b"hello", false)]);
     let eocd = zip.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
-    zip[eocd + 12..eocd + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+    // Keep this a normal ZIP directory declaration and exercise the caller's
+    // configured limit before the parser validates its archive offset.
+    zip[eocd + 12..eocd + 16].copy_from_slice(&64u32.to_le_bytes());
     let url = serve(zip).await;
     let client = reqwest::Client::new();
     let request: RequestFn = Arc::new(move |u: &str| client.get(u));
-    let err = list_remote_with_limits(&request, &url, ZipLimits::default()).await.unwrap_err();
+    let limits = ZipLimits { max_directory_size: 32, ..ZipLimits::default() };
+    let err = list_remote_with_limits(&request, &url, limits).await.unwrap_err();
     assert!(err.to_string().contains("directory is"), "{err}");
 }
 
