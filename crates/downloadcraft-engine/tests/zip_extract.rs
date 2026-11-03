@@ -5,9 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use downloadcraft_engine::zip::{
-    extract_remote, extract_remote_with_limits, list_remote, list_remote_with_limits, ZipLimits,
-};
+use downloadcraft_engine::zip::{extract_remote, list_remote, list_remote_with_limits, ZipLimits};
 use downloadcraft_engine::RequestFn;
 
 /// A ZIP with one stored and one deflated file.

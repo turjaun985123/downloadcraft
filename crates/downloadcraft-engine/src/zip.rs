@@ -616,7 +616,15 @@ pub(crate) mod tests {
         let mut tail = z[z.len() - 22..].to_vec();
         // size field of the EOCD -> 4 GiB
         tail[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
-        let err = parse(&tail, (z.len() - 22) as u64, u32::MAX as u64 + 1, &ZipLimits::default()).unwrap_err();
+        let err = match parse(
+            &tail,
+            (z.len() - 22) as u64,
+            u32::MAX as u64 + 1,
+            &ZipLimits::default(),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("directory size over the configured limit was accepted"),
+        };
         assert!(err.to_string().contains("directory is"), "{err}");
     }
 
