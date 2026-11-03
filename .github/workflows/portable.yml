@@ -15,11 +15,11 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.refresh_lock }}
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Resolve the workspace lockfile
         run: cargo generate-lockfile
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: Cargo-lockfile
           path: Cargo.lock
@@ -28,12 +28,12 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.refresh_lock }}
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libdbus-1-dev libxkbcommon-dev libwayland-dev libxkbcommon-x11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-xcb-dev libfontconfig1-dev libfreetype6-dev rpm squashfs-tools
@@ -47,7 +47,7 @@ jobs:
           curl -fL https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64 -o /tmp/runtime-x86_64
           python scripts/package_linux.py --binary target/x86_64-unknown-linux-gnu/release/download_craft --runtime /tmp/runtime-x86_64
           for image in dist/DownloadCraft-*-x86_64.AppImage; do "$image" --appimage-extract-and-run --version; done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: DownloadCraft-Linux
           path: dist/*
@@ -57,14 +57,14 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: '12.0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: node --test browser-extension/*.test.js
@@ -73,7 +73,7 @@ jobs:
       - run: cargo build --locked --release --target aarch64-apple-darwin --target x86_64-apple-darwin
       - run: lipo -create target/aarch64-apple-darwin/release/download_craft target/x86_64-apple-darwin/release/download_craft -output /tmp/download_craft
       - run: python scripts/package.py --platform macos --arch Universal --binary /tmp/download_craft
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: DownloadCraft-macOS
           path: dist/*.zip
@@ -81,12 +81,12 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.refresh_lock }}
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Windows resource compiler
@@ -101,7 +101,7 @@ jobs:
       - run: cargo check --locked --release --features gpui-ui
       - run: cargo build --locked --release
       - run: python scripts/package.py --platform windows --arch x64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: DownloadCraft-Windows
           path: dist/*.zip
