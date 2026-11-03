@@ -1084,7 +1084,7 @@ async fn fetch(
             Ok(Some(Ok(b))) => b,
         };
         body_bytes += chunk.len() as u64;
-        let mut data = &chunk[..];
+        let data = &chunk[..];
         let acc = lock(&run.map).take(id, w, data.len() as u64) as usize;
         if acc > 0 {
             buf.extend_from_slice(&data[..acc]);
