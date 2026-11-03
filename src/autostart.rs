@@ -14,10 +14,3 @@ pub const STARTUP_ARG: &str = "--startup";
 pub fn is_startup_launch(args: &[String]) -> bool {
     args.iter().any(|a| a == STARTUP_ARG)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-
-}

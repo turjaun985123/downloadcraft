@@ -92,6 +92,39 @@ pub fn t(english: &str) -> &str {
 
 /// The languages there are files for: (code, name shown in the picker).
 /// English is always first.
+#[cfg(test)]
+fn available() -> Vec<(String, String)> {
+    let mut result = vec![("en".to_string(), "English".to_string())];
+    for (code, json) in BUILTIN {
+        let name = serde_json::from_str::<serde_json::Value>(json)
+            .ok()
+            .and_then(|value| value.get("@name").and_then(|name| name.as_str()).map(str::to_string))
+            .unwrap_or_else(|| code.to_string());
+        result.push((code.to_string(), name));
+    }
+    for dir in lang_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            let Some(code) = filename.strip_suffix(".json").filter(|code| !code.contains('.')) else { continue };
+            if result.iter().any(|(existing, _)| existing == code) {
+                continue;
+            }
+            let name = std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+                .and_then(|value| value.get("@name").and_then(|name| name.as_str()).map(str::to_string))
+                .unwrap_or_else(|| code.to_string());
+            result.push((code.to_string(), name));
+        }
+    }
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(index) = result.iter().position(|(code, _)| code == "en") {
+        let english = result.remove(index);
+        result.insert(0, english);
+    }
+    result
+}
 
 
 #[cfg(test)]

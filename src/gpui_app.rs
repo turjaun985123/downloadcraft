@@ -918,6 +918,22 @@ impl DownloadManagerStore {
         }
         changed |= has_finished;
         changed |= self.reload();
+        let start_ids = crate::capture_service::take_wake_ids();
+        if !start_ids.is_empty() {
+            // A confirmation's "Start Download" signal is persisted separately
+            // from the queue row. Consume it only after reloading, then enter
+            // queue-running mode so freed worker slots keep advancing the batch.
+            self.queue_running = true;
+            for id in start_ids {
+                if self.tasks.len() >= self.max_concurrent {
+                    break;
+                }
+                if self.items.iter().any(|item| item.id == id && matches!(item.status, Status::Queued)) {
+                    self.start(id);
+                    changed = true;
+                }
+            }
+        }
         changed |= self.refresh_pending_capture();
         if has_finished || progress_checkpoint_due {
             self.persist();

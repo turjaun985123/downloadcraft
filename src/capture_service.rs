@@ -159,3 +159,24 @@ pub(crate) fn wake_ids(targets: &[u64]) {
         }
     });
 }
+
+/// Claim immediate-start requests written by confirmation or link-import
+/// windows. Queue writes complete before these IDs are published, so the
+/// manager can reload the queue and start each requested row exactly once.
+pub(crate) fn take_wake_ids() -> Vec<u64> {
+    let Some(path) = wake_path() else { return Vec::new() };
+    let _guard = crate::model::fs_lock("wake");
+    if !_guard.owned() {
+        return Vec::new();
+    }
+    let ids = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("start").cloned())
+        .and_then(|value| serde_json::from_value::<Vec<u64>>(value).ok())
+        .unwrap_or_default();
+    if !ids.is_empty() {
+        let _ = std::fs::remove_file(path);
+    }
+    ids
+}
