@@ -25,10 +25,12 @@ struct Incoming {
     #[serde(rename = "type")]
     kind: String,
     /// "report": one line for the app's log (a site's layout changed, ...).
-    #[serde(default)]
-    note: Option<String>,
     url: Option<String>,
     filename: Option<String>,
+    /// Stable per-capture id. Unlike `rid`, this survives a persistent-port
+    /// timeout and the bridge's one-shot fallback.
+    #[serde(default, alias = "captureId")]
+    capture_id: Option<String>,
     /// Page the download was captured from (IDM-style referer fallback).
     #[serde(default, alias = "pageUrl")]
     page_url: Option<String>,
@@ -82,6 +84,10 @@ struct Incoming {
     /// Request id on a persistent port; echoed on the reply.
     #[serde(default)]
     pub rid: Option<u64>,
+    /// Stable per-operation id used by one-shot retries for side effects
+    /// other than downloads (for example links, record, and control).
+    #[serde(default, alias = "requestId")]
+    request_id: Option<String>,
     /// The browser's side of the capture (method/body, request headers,
     /// server IP, proxy). Sanitized before it is stored.
     #[serde(default)]
@@ -167,10 +173,16 @@ pub fn open_links_window(page: &str, title: &str, cookie: &str, links: &[PageLin
     let json = serde_json::to_string(&batch).map_err(|e| e.to_string())?;
     crate::model::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
     let exe = crate::platform::launch_path().map_err(|e| e.to_string())?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--links").arg(&path);
-    spawn_detached(cmd);
-    Ok(())
+    let mut cmd = crate::platform::silent_command(exe);
+    let app_state = crate::model::app_lifecycle_state();
+    if !matches!(app_state.as_str(), "starting" | "running") {
+        cmd.arg("--links").arg(&path);
+    }
+    if spawn_detached(cmd) {
+        Ok(())
+    } else {
+        Err("could not start the links window".into())
+    }
 }
 
 /// Started by the browser straight from the manifest, without the launcher
@@ -178,17 +190,24 @@ pub fn open_links_window(page: &str, title: &str, cookie: &str, links: &[PageLin
 /// Firefox the manifest path and then the extension's id. Used when the
 /// program sits under a non-ASCII path, which a `.bat` cannot name (issue #5).
 pub fn launched_directly(args: &[String]) -> bool {
-    let ours = |a: &String| {
+    let ours = |a: &str| {
         a.strip_prefix("chrome-extension://").is_some_and(|rest| {
             let id = rest.trim_end_matches('/');
-            id == crate::app::EXTENSION_ID || crate::app::STORE_EXTENSION_IDS.contains(&id)
-        }) || a == "send-to-download-craft@example"
+            id == crate::integration::EXTENSION_ID || crate::integration::STORE_EXTENSION_IDS.contains(&id)
+        }) || a.starts_with("moz-extension://") || a == "send-to-download-craft@example"
     };
-    args.iter().skip(1).take(2).any(ours)
+    let launch_args: Vec<&str> = args.iter().skip(1).take(3).map(String::as_str).collect();
+    let has_origin = launch_args.iter().any(|arg| ours(arg));
+    // Firefox passes the registered host manifest followed by the add-on id.
+    // Requiring both avoids mistaking a normal CLI download of `*.json` for a
+    // native-host launch.
+    let has_manifest = launch_args.iter().take(2).any(|arg| arg.to_ascii_lowercase().ends_with(".json"));
+    let has_firefox_id = launch_args.iter().any(|arg| *arg == "send-to-download-craft@example");
+    has_origin || (has_manifest && has_firefox_id)
 }
 
 /// Spawn a window that outlives this short-lived host.
-fn spawn_detached(mut cmd: std::process::Command) {
+fn spawn_detached(mut cmd: std::process::Command) -> bool {
     // Never hand our stdio to the window: an inherited stdout keeps the
     // browser's pipe open after this host exits.
     cmd.stdin(std::process::Stdio::null())
@@ -209,9 +228,10 @@ fn spawn_detached(mut cmd: std::process::Command) {
         // still beats none at all.
         cmd.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
         if cmd.spawn().is_ok() {
-            return;
+            return true;
         }
         cmd.creation_flags(DETACHED_PROCESS);
+        return cmd.spawn().is_ok();
     }
     // Linux/macOS: out of the host's process group, which the browser may
     // signal as a whole when it closes the host.
@@ -219,8 +239,8 @@ fn spawn_detached(mut cmd: std::process::Command) {
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+        cmd.spawn().is_ok()
     }
-    let _ = cmd.spawn();
 }
 
 #[derive(Debug, Serialize)]
@@ -242,14 +262,17 @@ struct Reply {
     /// `{"type":"list"}`: the app's active and recent downloads.
     #[serde(skip_serializing_if = "Option::is_none")]
     items: Option<Vec<serde_json::Value>>,
+    /// Main GUI liveness is separate from native-host responsiveness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_state: Option<String>,
 }
 
 impl Reply {
     fn ok() -> Self {
-        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, theme: None, items: None }
+        Reply { kind: "ok".into(), version: None, queued: Some(true), error: None, urls: None, theme: None, items: None, app_state: None }
     }
     fn err(e: impl Into<String>) -> Self {
-        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, theme: None, items: None }
+        Reply { kind: "error".into(), version: None, queued: None, error: Some(e.into()), urls: None, theme: None, items: None, app_state: None }
     }
 }
 
@@ -378,6 +401,9 @@ pub struct InboxItem {
     pub url: String,
     pub filename: Option<String>,
     pub received_at: String,
+    /// Stable browser capture id, retained only in the private inbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<String>,
     /// Page URL the media was captured from (used as Referer fallback).
     #[serde(default)]
     pub page_url: Option<String>,
@@ -415,47 +441,223 @@ pub struct InboxItem {
     pub browser: Option<crate::model::BrowserContext>,
 }
 
-/// Lines the browser extension asked to show in the app's log.
-pub fn notes_path() -> Option<std::path::PathBuf> {
-    crate::model::config_dir().map(|p| p.join("extension_notes.txt"))
-}
-
-/// Append one note (single line, bounded); the file is capped so a page
-/// that reports in a loop cannot grow it.
-fn append_extension_note(text: &str) {
-    let Some(path) = notes_path() else { return };
-    let line: String = text.chars().filter(|c| !c.is_control()).take(300).collect();
-    if line.trim().is_empty() {
-        return;
-    }
-    let _guard = crate::model::fs_lock("extension_notes");
-    let mut lines: Vec<String> = std::fs::read_to_string(&path)
-        .map(|s| s.lines().map(str::to_string).collect())
-        .unwrap_or_default();
-    if lines.iter().any(|l| l == &line) {
-        return;
-    }
-    lines.push(line);
-    let keep = lines.len().saturating_sub(50);
-    let _ = std::fs::write(&path, lines[keep..].join("
-") + "
-");
-}
-
-/// Take every pending note (the app shows them in its log).
-pub fn take_extension_notes() -> Vec<String> {
-    let Some(path) = notes_path() else { return Vec::new() };
-    let _guard = crate::model::fs_lock("extension_notes");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let _ = std::fs::remove_file(&path);
-    text.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect()
-}
-
 pub fn inbox_path() -> Option<std::path::PathBuf> {
     crate::model::config_dir().map(|p| p.join("native_inbox.json"))
+}
+
+/// Read a stable inbox snapshot for the main GPUI process. Reading never
+/// consumes a capture: the caller acknowledges it only after the user commits
+/// the download or explicitly cancels its confirmation, so a process exit
+/// leaves the request available for recovery.
+pub fn pending_captures() -> Result<Vec<InboxItem>, String> {
+    let path = inbox_path().ok_or_else(|| "no config dir".to_string())?;
+    let _guard = crate::model::fs_lock("inbox");
+    if !_guard.owned() {
+        return Err("download inbox is busy; retry shortly".into());
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|_| "download inbox unreadable; kept for recovery".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("could not read download inbox: {error}")),
+    }
+}
+
+/// Acknowledge one inbox item after its in-process confirmation is resolved.
+/// The identity matches a stable URL row (and its capture id when available),
+/// not an unrelated queued capture. Returns false if another owner already
+/// claimed the item (for example, the standalone fallback dialog).
+pub fn acknowledge_capture(target: &InboxItem) -> Result<bool, String> {
+    let path = inbox_path().ok_or_else(|| "no config dir".to_string())?;
+    let _guard = crate::model::fs_lock("inbox");
+    if !_guard.owned() {
+        return Err("download inbox is busy; retry shortly".into());
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("could not read download inbox: {error}")),
+    };
+    let mut items: Vec<InboxItem> = serde_json::from_str(&text)
+        .map_err(|_| "download inbox unreadable; kept for recovery".to_string())?;
+    let index = items.iter().position(|item| {
+        if let Some(id) = target.capture_id.as_deref() {
+            item.url == target.url && item.capture_id.as_deref() == Some(id)
+        } else {
+            item.url == target.url
+                && item.received_at == target.received_at
+                && item.capture_id.is_none()
+        }
+    });
+    let Some(index) = index else { return Ok(false) };
+    if let Some(id) = target.capture_id.as_deref() {
+        let receipt_path = receipt_path().ok_or_else(|| "no config dir".to_string())?;
+        let now = chrono::Utc::now().timestamp();
+        let mut receipts = load_receipts(&receipt_path, now)?;
+        if let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.capture_id == id) {
+            // The user resolved this confirmation. A late one-shot retry for
+            // its old capture id must not reopen the dialog after the inbox
+            // row is acknowledged.
+            receipt.dialog_pending = false;
+            save_receipts(&receipt_path, &receipts)?;
+        }
+    }
+    items.remove(index);
+    if items.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not acknowledge browser capture: {error}")),
+        }
+    } else {
+        let bytes = serde_json::to_vec_pretty(&items).map_err(|error| error.to_string())?;
+        crate::model::atomic_write(&path, &bytes).map_err(|error| error.to_string())?;
+    }
+    Ok(true)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct CaptureReceipt {
+    capture_id: String,
+    accepted_at: i64,
+    /// Retried requests may retry opening their confirmation until the host
+    /// has successfully spawned it. A completed receipt has no side effects.
+    #[serde(default)]
+    dialog_pending: bool,
+}
+
+const RECEIPT_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+const MAX_CAPTURE_RECEIPTS: usize = 4096;
+
+fn receipt_path() -> Option<std::path::PathBuf> {
+    crate::model::config_dir().map(|p| p.join("native_capture_receipts.json"))
+}
+
+pub(crate) fn valid_capture_id(id: &str) -> bool {
+    (8..=96).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Stable per-URL lock name shared by the host and standalone confirm UI.
+pub(crate) fn confirm_window_name(url: &str) -> String {
+    use sha2::Digest;
+    format!("confirm_{:x}", sha2::Sha256::digest(url.as_bytes()))
+}
+
+fn load_receipts(path: &std::path::Path, now: i64) -> Result<Vec<CaptureReceipt>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not read capture receipts: {error}")),
+    };
+    let mut receipts: Vec<CaptureReceipt> = serde_json::from_str(&text)
+        .map_err(|_| "capture receipt file unreadable; kept for recovery".to_string())?;
+    receipts.retain(|r| now.saturating_sub(r.accepted_at) <= RECEIPT_TTL_SECS);
+    if receipts.len() > MAX_CAPTURE_RECEIPTS {
+        let excess = receipts.len() - MAX_CAPTURE_RECEIPTS;
+        receipts.drain(..excess);
+    }
+    Ok(receipts)
+}
+
+fn save_receipts(path: &std::path::Path, receipts: &[CaptureReceipt]) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(receipts).map_err(|e| e.to_string())?;
+    crate::model::atomic_write(path, &bytes).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeRequestReceipt {
+    request_id: String,
+    kind: String,
+    accepted_at: i64,
+}
+
+const REQUEST_RECEIPT_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+const MAX_REQUEST_RECEIPTS: usize = 4096;
+
+/// Run retryable side effects at most once across native-host processes.
+/// The receipt is persisted before the effect: if the host exits after the
+/// effect but before its reply reaches the extension, a retry cannot repeat
+/// the command or open another Links window.
+fn with_request_receipt(
+    request_id: Option<&str>,
+    kind: &str,
+    action: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(request_id) = request_id.filter(|id| valid_capture_id(id)) else {
+        return action();
+    };
+    let path = crate::model::config_dir()
+        .ok_or_else(|| "no config dir".to_string())?
+        .join("native_request_receipts.json");
+    let _guard = crate::model::fs_lock("native-requests");
+    if !_guard.owned() {
+        return Err("native request is busy; retry shortly".into());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut receipts: Vec<NativeRequestReceipt> = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|_| "native request receipts are unreadable".to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    receipts.retain(|entry| now.saturating_sub(entry.accepted_at) <= REQUEST_RECEIPT_TTL_SECS);
+    if let Some(existing) = receipts.iter().find(|entry| entry.request_id == request_id) {
+        return if existing.kind == kind {
+            Ok(())
+        } else {
+            Err("request id was already used for a different operation".into())
+        };
+    }
+
+    receipts.push(NativeRequestReceipt {
+        request_id: request_id.to_string(),
+        kind: kind.to_string(),
+        accepted_at: now,
+    });
+    if receipts.len() > MAX_REQUEST_RECEIPTS {
+        let excess = receipts.len() - MAX_REQUEST_RECEIPTS;
+        receipts.drain(..excess);
+    }
+    let persist = |entries: &[NativeRequestReceipt]| -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(entries).map_err(|error| error.to_string())?;
+        crate::model::atomic_write(&path, &bytes).map_err(|error| error.to_string())
+    };
+    persist(&receipts)?;
+    match action() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            receipts.retain(|entry| entry.request_id != request_id);
+            persist(&receipts)?;
+            Err(error)
+        }
+    }
+}
+
+/// Called with the inbox lock held so concurrent native-host processes cannot
+/// each accept the same capture ID before its receipt is persisted.
+fn record_capture_locked(
+    receipts: &mut Vec<CaptureReceipt>,
+    capture_id: &str,
+    pending: bool,
+    now: i64,
+) -> Result<(), String> {
+    if let Some(receipt) = receipts.iter_mut().find(|r| r.capture_id == capture_id) {
+        receipt.dialog_pending = pending;
+        return Ok(());
+    }
+    receipts.push(CaptureReceipt {
+        capture_id: capture_id.to_string(),
+        accepted_at: now,
+        dialog_pending: pending,
+    });
+    if receipts.len() > MAX_CAPTURE_RECEIPTS {
+        let excess = receipts.len() - MAX_CAPTURE_RECEIPTS;
+        receipts.drain(..excess);
+    }
+    Ok(())
 }
 
 /// One stdin frame: clean EOF (browser gone → exit the host) vs a broken
@@ -651,6 +853,45 @@ fn safe_fetch_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// One page-fetch answer may carry this much decoded data at most.
+const MAX_PAGE_FETCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Requests older than this are dead: the app stopped waiting long ago.
+const FETCH_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Results and partial answers are swept after a day.
+const FETCH_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// `asked` entries are forgotten once their request is gone; this is the
+/// hard cap for a page that keeps creating new ones.
+const MAX_ASKED: usize = 512;
+
+fn is_regular_file(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.is_file() && !m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn older_than(path: &std::path::Path, age: std::time::Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|elapsed| elapsed > age)
+}
+
+/// Remove page-fetch files nobody will read anymore.
+fn cleanup_page_fetch_dir(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.ends_with(".req.json") || name.ends_with(".part") || name.ends_with(".res") || name.ends_with(".err")) {
+            continue;
+        }
+        let path = e.path();
+        if older_than(&path, FETCH_FILE_TTL) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// One queue row as an event for the extension.
 fn row_event(d: &crate::model::DownloadItem, event: &str, error: &str) -> serde_json::Value {
     serde_json::json!({
@@ -667,7 +908,8 @@ fn push_loop() {
     let mut last_settings = serde_json::Value::Null;
     let mut known: std::collections::HashMap<u64, u8> = std::collections::HashMap::new();
     let mut first = true;
-    let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut asked: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+    let mut last_cleanup = std::time::Instant::now();
     loop {
         let settings = serde_json::json!({ "type": "settings", "settings": capture_settings(), "rules": site_rules() });
         if settings != last_settings {
@@ -699,16 +941,29 @@ fn push_loop() {
             }
         }
         first = false;
+        if last_cleanup.elapsed() >= std::time::Duration::from_secs(60) {
+            if let Some(dir) = page_fetch_dir() {
+                cleanup_page_fetch_dir(&dir);
+            }
+            last_cleanup = std::time::Instant::now();
+        }
         // Page-fetch requests the app is waiting on.
+        let now = std::time::Instant::now();
+        asked.retain(|_, requested_at| now.duration_since(*requested_at) < FETCH_REQUEST_TTL);
         if let Some(dir) = page_fetch_dir() {
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
                     let Some(id) = name.strip_suffix(".req.json") else { continue };
-                    if !safe_fetch_id(id) || asked.contains(id) {
+                    if !safe_fetch_id(id) || asked.contains_key(id) {
                         continue;
                     }
-                    asked.insert(id.to_string());
+                    if asked.len() >= MAX_ASKED {
+                        if let Some(oldest) = asked.iter().min_by_key(|(_, at)| **at).map(|(key, _)| key.clone()) {
+                            asked.remove(&oldest);
+                        }
+                    }
+                    asked.insert(id.to_string(), now);
                     if let Some(req) = std::fs::read_to_string(e.path()).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
                         write_value(&serde_json::json!({
                             "type": "pageFetch", "id": id,
@@ -729,7 +984,8 @@ fn page_fetch_chunk(msg: &Incoming) -> Result<(), String> {
         return Err("bad fetch id".into());
     }
     let dir = page_fetch_dir().ok_or("no config dir")?;
-    if !dir.join(format!("{id}.req.json")).exists() {
+    let request = dir.join(format!("{id}.req.json"));
+    if !is_regular_file(&request) {
         return Err("no such fetch request".into());
     }
     let part = dir.join(format!("{id}.part"));
@@ -740,12 +996,27 @@ fn page_fetch_chunk(msg: &Incoming) -> Result<(), String> {
     }
     if let Some(c) = msg.chunk.as_deref().filter(|c| !c.is_empty()) {
         let bytes = crate::model::base64_decode(c).ok_or("bad chunk")?;
+        let existing_size = match std::fs::symlink_metadata(&part) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata.len(),
+            Ok(_) => return Err("invalid page-fetch partial file".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.to_string()),
+        };
+        let next_size = existing_size
+            .checked_add(bytes.len() as u64)
+            .ok_or("page-fetch response exceeds the size limit")?;
+        if next_size > MAX_PAGE_FETCH_BYTES {
+            return Err("page-fetch response exceeds the size limit".into());
+        }
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&part).map_err(|e| e.to_string())?;
         f.write_all(&bytes).map_err(|e| e.to_string())?;
     }
     if msg.done {
-        if !part.exists() {
+        if !is_regular_file(&part) {
+            if part.exists() {
+                return Err("invalid page-fetch partial file".into());
+            }
             std::fs::write(&part, b"").map_err(|e| e.to_string())?;
         }
         std::fs::rename(&part, dir.join(format!("{id}.res"))).map_err(|e| e.to_string())?;
@@ -758,7 +1029,30 @@ fn page_fetch_chunk(msg: &Incoming) -> Result<(), String> {
 /// name gave "_home_me_Downloads_x.zip" (issue #6).
 fn file_part(name: &str) -> Option<String> {
     let last = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
-    (!last.is_empty()).then(|| last.to_string())
+    if last.is_empty()
+        || matches!(last, "." | "..")
+        || last.contains(':') // Includes Windows alternate data stream syntax.
+        || last.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(last.to_string())
+}
+
+fn preferred_referer(page_url: Option<&str>, referer: Option<&str>) -> Option<String> {
+    let page = page_url.filter(|s| !s.trim().is_empty());
+    let captured = referer.filter(|s| !s.trim().is_empty());
+    let has_path = |u: &str| {
+        reqwest::Url::parse(u)
+            .map(|parsed| parsed.path() != "/" && !parsed.path().is_empty())
+            .unwrap_or(false)
+    };
+    match (page, captured) {
+        (Some(page), Some(captured)) if captured != page && has_path(captured) => Some(captured.to_string()),
+        (Some(page), _) => Some(page.to_string()),
+        (None, Some(captured)) => Some(captured.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// Keep only headers the engine may replay, with sane sizes. The extension
@@ -785,27 +1079,47 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
     const MAX_INBOX: usize = 200;
     let url = msg.url.clone().unwrap_or_default();
     let path = inbox_path().ok_or_else(|| "no config dir".to_string())?;
+    let receipts_path = receipt_path().ok_or_else(|| "no config dir".to_string())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let _guard = crate::model::fs_lock("inbox");
     if !_guard.owned() { return Err("Download inbox is busy; retry shortly".into()); }
+    let now = chrono::Utc::now().timestamp();
+    let mut receipts = load_receipts(&receipts_path, now)?;
+    let capture_id = msg.capture_id.as_deref().filter(|id| valid_capture_id(id));
+    let window_name = confirm_window_name(&url);
+    let dialog_active = crate::model::window_is_claimed(&window_name);
+    if let Some(id) = capture_id {
+        if let Some(receipt) = receipts.iter_mut().find(|r| r.capture_id == id) {
+            if dialog_active {
+                receipt.dialog_pending = false;
+            }
+            let should_retry_dialog = receipt.dialog_pending && !dialog_active;
+            save_receipts(&receipts_path, &receipts)?;
+            return Ok(should_retry_dialog);
+        }
+    }
     // Never destroy pending captures on an unreadable inbox.
-    let data = std::fs::read_to_string(&path).ok();
-    let mut items: Vec<InboxItem> = match data {
-        None => Vec::new(), // no file yet
-        Some(s) => serde_json::from_str(&s)
+    let mut items: Vec<InboxItem> = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("could not read download inbox: {e}")),
+        Ok(s) => serde_json::from_str(&s)
             .map_err(|_| "inbox unreadable — kept for the next poll".to_string())?,
     };
-    let referer = msg
-        .referer
-        .clone()
-        .or_else(|| msg.page_url.clone())
-        .filter(|s| !s.trim().is_empty());
+    if let Some(id) = capture_id {
+        if items.iter().any(|item| item.capture_id.as_deref() == Some(id)) {
+            record_capture_locked(&mut receipts, id, !dialog_active, now)?;
+            save_receipts(&receipts_path, &receipts)?;
+            return Ok(!dialog_active);
+        }
+    }
+    let referer = preferred_referer(msg.page_url.as_deref(), msg.referer.as_deref());
     let fresh = InboxItem {
         url: url.clone(),
         filename: msg.filename.as_deref().and_then(file_part),
         received_at: chrono::Local::now().to_rfc3339(),
+        capture_id: capture_id.map(str::to_string),
         page_url: msg.page_url.clone(),
         referer,
         cookie: msg.cookie.clone().filter(|s| !s.trim().is_empty()),
@@ -821,10 +1135,18 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
         browser: msg.browser.clone().and_then(|b| b.sanitized()),
     };
     // Same URL re-captured: refresh metadata instead of ignoring it (the
-    // filename/referer/cookie may be corrected this time).
+    // filename/referer/cookie may be corrected this time. Keep the inbox
+    // identity stable so the GPUI manager can refresh its existing dialog
+    // instead of opening a second one for a new timestamp.
     let is_new = match items.iter_mut().find(|i| i.url == url) {
         Some(existing) => {
+            let previous_capture_id = existing.capture_id.clone();
+            let previous_received_at = existing.received_at.clone();
             *existing = fresh;
+            existing.received_at = previous_received_at;
+            if previous_capture_id.is_some() {
+                existing.capture_id = previous_capture_id;
+            }
             false
         }
         None => {
@@ -832,27 +1154,61 @@ fn queue_download(msg: &Incoming) -> Result<bool, String> {
             true
         }
     };
+    if dialog_active && is_new {
+        // Do not leave a second same-URL row behind. If a row is still
+        // pending, the merge above refreshes its metadata for the open dialog.
+        items.pop();
+        if let Some(id) = capture_id {
+            record_capture_locked(&mut receipts, id, false, now)?;
+            save_receipts(&receipts_path, &receipts)?;
+        }
+        return Ok(false);
+    }
     if items.len() > MAX_INBOX {
         items.sort_by(|a, b| b.received_at.cmp(&a.received_at));
         items.truncate(MAX_INBOX);
     }
-    let json = serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?;
-    crate::model::atomic_write(&path,json.as_bytes()).map_err(|e|e.to_string())?;
+    let json = serde_json::to_vec_pretty(&items).map_err(|e| e.to_string())?;
+    crate::model::atomic_write(&path, &json).map_err(|e| e.to_string())?;
+    if let Some(id) = capture_id {
+        record_capture_locked(&mut receipts, id, is_new, now)?;
+        save_receipts(&receipts_path, &receipts)?;
+    }
     Ok(is_new)
+}
+
+fn mark_capture_dialog_spawned(capture_id: &str) {
+    if !valid_capture_id(capture_id) {
+        return;
+    }
+    let Some(path) = receipt_path() else { return };
+    let _guard = crate::model::fs_lock("inbox");
+    if !_guard.owned() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Ok(mut receipts) = load_receipts(&path, now) else { return };
+    if let Some(receipt) = receipts.iter_mut().find(|r| r.capture_id == capture_id) {
+        receipt.dialog_pending = false;
+        let _ = save_receipts(&path, &receipts);
+    }
 }
 
 /// Fire-and-forget the standalone Download File Info dialog (detached, so
 /// it outlives this short-lived native-host process).
-fn spawn_confirm(msg: &Incoming) {
+fn spawn_confirm(msg: &Incoming) -> bool {
     let url = msg.url.clone().unwrap_or_default();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return;
+        return false;
     }
     let Ok(exe) = crate::platform::launch_path() else {
-        return;
+        return false;
     };
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = crate::platform::silent_command(exe);
     cmd.arg("--confirm-download").arg("--url").arg(&url);
+    if let Some(id) = msg.capture_id.as_deref().filter(|id| valid_capture_id(id)) {
+        cmd.arg("--capture-id").arg(id);
+    }
     if let Some(f) = msg.filename.as_deref().and_then(file_part) {
         cmd.arg("--filename").arg(f);
     }
@@ -861,15 +1217,7 @@ fn spawn_confirm(msg: &Incoming) {
     // wins over an origin-only Referer ("https://www.youtube.com/"). A
     // Referer with a real path is an embedded player's page, which the CDN
     // checks (sending the article URL instead got 403s): that one wins.
-    let page = msg.page_url.clone().filter(|s| !s.trim().is_empty());
-    let captured = msg.referer.clone().filter(|s| !s.trim().is_empty());
-    let has_path = |u: &str| reqwest::Url::parse(u).map(|x| x.path() != "/" && !x.path().is_empty()).unwrap_or(false);
-    let pick = match (page, captured) {
-        (Some(p), Some(r)) if r != p && has_path(&r) => Some(r),
-        (Some(p), _) => Some(p),
-        (None, r) => r,
-    };
-    if let Some(r) = pick {
+    if let Some(r) = preferred_referer(msg.page_url.as_deref(), msg.referer.as_deref()) {
         cmd.arg("--referer").arg(r);
     }
     // The dialog claims credentials from the owner-only inbox.
@@ -892,7 +1240,7 @@ fn spawn_confirm(msg: &Incoming) {
     if let Some(d) = msg.dur.filter(|s| *s > 0) {
         cmd.arg("--dur").arg(d.to_string());
     }
-    spawn_detached(cmd);
+    spawn_detached(cmd)
 }
 
 /// The extension just talked to the app: the "Get ready" window shows it as
@@ -906,7 +1254,7 @@ fn note_extension_seen() {
 }
 
 /// Entry point when launched with `--native-host`. Never returns normally.
-pub fn run() -> eframe::Result<()> {
+pub fn run() {
     // Keep stderr quiet; any panic text would corrupt the pipe (stdout stays clean).
     loop {
         match read_message() {
@@ -931,6 +1279,7 @@ pub fn run() -> eframe::Result<()> {
                     urls: None,
                     theme: Some(app_theme()),
                     items: None,
+                    app_state: Some(crate::model::app_lifecycle_state()),
                 });
             }
             "setPrefs" => match msg.prefs.as_ref().map(set_prefs).unwrap_or(Ok(())) {
@@ -941,12 +1290,6 @@ pub fn run() -> eframe::Result<()> {
                 Ok(()) => write_message(&Reply::ok()),
                 Err(e) => write_message(&Reply::err(e)),
             },
-            "report" => {
-                if let Some(text) = msg.note.as_deref() {
-                    append_extension_note(text);
-                }
-                write_message(&Reply::ok());
-            }
             "ping" => write_message(&{ note_extension_seen(); Reply {
                 kind: "pong".into(),
                 version: Some(1),
@@ -955,6 +1298,7 @@ pub fn run() -> eframe::Result<()> {
                 urls: None,
                 theme: Some(app_theme()),
                 items: None,
+                app_state: Some(crate::model::app_lifecycle_state()),
             } }),
             "query" => {
                 // Presence check only: no queueing, no dialogs, no locks held
@@ -969,6 +1313,7 @@ pub fn run() -> eframe::Result<()> {
                     urls: Some(hits),
                     theme: None,
                     items: None,
+                    app_state: None,
                 });
             }
             "download" => {
@@ -988,17 +1333,25 @@ pub fn run() -> eframe::Result<()> {
                     continue;
                 }
                 match queue_download(&msg) {
-                    // A row is waiting for a fresh link ("Refresh download
-                    // address"): the app takes this capture, no dialog.
-                    Ok(_) if crate::model::refresh_wait().is_some() => write_message(&Reply::ok()),
-                    Ok(_is_new) => {
+                    Ok(should_prompt) => {
                         write_message(&Reply::ok());
-                        // IDM-style: pop the standalone Download File Info
-                        // window in front. The inbox entry doubles as a
-                        // fallback — the dialog claims it on open, and the
-                        // main window only prompts for entries the dialog
-                        // never claimed (see poll_inbox age gate).
-                        spawn_confirm(&msg);
+                        let gui_accepts_captures = matches!(
+                            crate::model::app_lifecycle_state().as_str(),
+                            "starting" | "running"
+                        );
+                        if should_prompt && !gui_accepts_captures {
+                            // IDM-style: one dialog for this URL. A request
+                            // retry may spawn a second short-lived process,
+                            // but the per-URL window lock admits only one.
+                            // When the main GPUI process is accepting captures,
+                            // it reads this durable inbox row and mounts the
+                            // confirmation in its own window instead.
+                            if spawn_confirm(&msg) {
+                                if let Some(id) = msg.capture_id.as_deref() {
+                                    mark_capture_dialog_spawned(id);
+                                }
+                            }
+                        }
                     }
                     Err(e) => write_message(&Reply::err(e)),
                 }
@@ -1011,16 +1364,27 @@ pub fn run() -> eframe::Result<()> {
                 urls: None,
                 theme: None,
                 items: Some(app_downloads()),
+                app_state: None,
             }),
-            "record" => match record_browser_download(&msg) {
+            "record" => match with_request_receipt(
+                msg.request_id.as_deref(),
+                "record",
+                || record_browser_download(&msg),
+            ) {
                 Ok(()) => write_message(&Reply::ok()),
                 Err(e) => write_message(&Reply::err(e)),
             },
-            "control" => match app_control(msg.id, msg.action.as_deref().unwrap_or("")) {
+            "control" => match with_request_receipt(msg.request_id.as_deref(), "control", || {
+                app_control(msg.id, msg.action.as_deref().unwrap_or(""))
+            }) {
                 Ok(()) => write_message(&Reply::ok()),
                 Err(e) => write_message(&Reply::err(e)),
             },
-            "links" => match spawn_links(&msg) {
+            "links" => match with_request_receipt(
+                msg.request_id.as_deref(),
+                "links",
+                || spawn_links(&msg),
+            ) {
                 Ok(()) => write_message(&Reply::ok()),
                 Err(e) => write_message(&Reply::err(e)),
             },
@@ -1029,7 +1393,6 @@ pub fn run() -> eframe::Result<()> {
             }
         }
     }
-    Ok(())
 }
 
 static PUSHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1037,6 +1400,43 @@ static PUSHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 #[cfg(test)]
 mod media_tests {
     use super::*;
+    #[test]
+    fn capture_ids_are_read_from_the_extension_and_validated() {
+        let msg: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://e.test/a","captureId":"capture-1234"}"#).unwrap();
+        assert_eq!(msg.capture_id.as_deref(), Some("capture-1234"));
+        assert!(valid_capture_id("capture-1234"));
+        assert!(!valid_capture_id("../capture"));
+        assert!(!valid_capture_id("short"));
+    }
+
+    #[test]
+    fn capture_receipts_are_idempotent_and_expire() {
+        let now = chrono::Utc::now().timestamp();
+        let mut receipts = Vec::new();
+        record_capture_locked(&mut receipts, "capture-1234", true, now).unwrap();
+        record_capture_locked(&mut receipts, "capture-1234", false, now + 1).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert!(!receipts[0].dialog_pending);
+
+        let dir = std::env::temp_dir().join(format!("dc_receipt_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("receipts.json");
+        save_receipts(&path, &receipts).unwrap();
+        let loaded = load_receipts(&path, now + 2).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].capture_id, "capture-1234");
+
+        let expired = load_receipts(&path, now + RECEIPT_TTL_SECS + 2).unwrap();
+        assert!(expired.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn confirmation_slot_name_is_stable_per_url() {
+        assert_eq!(confirm_window_name("https://e.test/a"), confirm_window_name("https://e.test/a"));
+        assert_ne!(confirm_window_name("https://e.test/a"), confirm_window_name("https://e.test/b"));
+    }
+
     #[test]
     fn player_expectations_survive_browser_and_inbox_formats() {
         let msg: Incoming = serde_json::from_str(r#"{"type":"download","url":"https://cdn.example.org/video.mp4","dur":2700,"audioExpected":true}"#).unwrap();
@@ -1064,7 +1464,7 @@ mod media_tests {
 
     #[test]
     fn browser_launches_without_the_flag_are_recognised() {
-        let ext = format!("chrome-extension://{}/", crate::app::EXTENSION_ID);
+        let ext = format!("chrome-extension://{}/", crate::integration::EXTENSION_ID);
         assert!(launched_directly(&["dc.exe".into(), ext, "--parent-window=0".into()]));
         assert!(launched_directly(&["dc.exe".into(), r"C:\m.json".into(), "send-to-download-craft@example".into()]));
         assert!(!launched_directly(&["dc.exe".into(), "chrome-extension://someoneelse/".into()]));
@@ -1077,6 +1477,10 @@ mod media_tests {
         assert_eq!(file_part(r"C:\Users\me\Downloads\b.exe").as_deref(), Some("b.exe"));
         assert_eq!(file_part("plain.txt").as_deref(), Some("plain.txt"));
         assert_eq!(file_part("/home/me/"), None);
+        assert_eq!(file_part("../../safe.txt").as_deref(), Some("safe.txt"));
+        assert_eq!(file_part("file.txt:stream"), None);
+        assert_eq!(file_part("bad\0name.txt"), None);
+        assert_eq!(file_part("bad\u{0007}name.txt"), None);
     }
 
     #[test]

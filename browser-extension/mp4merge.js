@@ -12,28 +12,46 @@
 
   const CONTAINERS = new Set(["moov", "trak", "mdia", "minf", "stbl", "mvex", "moof", "traf", "edts", "dinf"]);
 
-  const u32 = (b, i) => ((b[i] << 24) >>> 0) + (b[i + 1] << 16) + (b[i + 2] << 8) + b[i + 3];
-  const put32 = (b, i, v) => { b[i] = (v >>> 24) & 255; b[i + 1] = (v >>> 16) & 255; b[i + 2] = (v >>> 8) & 255; b[i + 3] = v & 255; };
-  const u64 = (b, i) => u32(b, i) * 4294967296 + u32(b, i + 4);
+  const need = (b, i, n) => {
+    if (!Number.isSafeInteger(i) || !Number.isSafeInteger(n) || i < 0 || n < 0 || i > b.length - n) {
+      throw new Error("mp4: truncated box field");
+    }
+  };
+  const byteAt = (b, i) => { need(b, i, 1); return b[i]; };
+  const u32 = (b, i) => {
+    need(b, i, 4);
+    return ((b[i] << 24) >>> 0) + (b[i + 1] << 16) + (b[i + 2] << 8) + b[i + 3];
+  };
+  const put32 = (b, i, v) => { need(b, i, 4); b[i] = (v >>> 24) & 255; b[i + 1] = (v >>> 16) & 255; b[i + 2] = (v >>> 8) & 255; b[i + 3] = v & 255; };
+  const u64 = (b, i) => {
+    need(b, i, 8);
+    const value = u32(b, i) * 4294967296 + u32(b, i + 4);
+    if (!Number.isSafeInteger(value)) throw new Error("mp4: box size is not safely representable");
+    return value;
+  };
   const put64 = (b, i, v) => { put32(b, i, Math.floor(v / 4294967296)); put32(b, i + 4, v % 4294967296); };
-  const typeAt = (b, i) => String.fromCharCode(b[i], b[i + 1], b[i + 2], b[i + 3]);
+  const typeAt = (b, i) => { need(b, i, 4); return String.fromCharCode(b[i], b[i + 1], b[i + 2], b[i + 3]); };
 
   // Child boxes of [start, end): {type, start, end, body} (body = payload start).
   function boxes(b, start, end) {
     const out = [];
     let i = start;
-    while (i + 8 <= end) {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > b.length) {
+      throw new Error("mp4: invalid box bounds");
+    }
+    while (i < end) {
+      if (end - i < 8) throw new Error(`mp4: truncated box header at ${i}`);
       let size = u32(b, i);
       const type = typeAt(b, i + 4);
       let body = i + 8;
       if (size === 1) {
-        if (i + 16 > end) break;
+        if (end - i < 16) throw new Error(`mp4: truncated extended ${type} box at ${i}`);
         size = u64(b, i + 8);
         body = i + 16;
       } else if (size === 0) {
         size = end - i;
       }
-      if (size < body - i || i + size > end) throw new Error(`mp4: bad ${type} box at ${i}`);
+      if (!Number.isSafeInteger(size) || size < body - i || size > end - i) throw new Error(`mp4: bad ${type} box at ${i}`);
       out.push({ type, start: i, end: i + size, body });
       i += size;
     }
@@ -52,7 +70,7 @@
     if (!traks.length) throw new Error("mp4: no track");
     const trak = traks[0];
     const mdhd = path(b, trak, ["mdia", "mdhd"]);
-    const timescale = mdhd ? (b[mdhd.body] === 1 ? u32(b, mdhd.body + 20) : u32(b, mdhd.body + 12)) : 0;
+    const timescale = mdhd ? (byteAt(b, mdhd.body) === 1 ? u32(b, mdhd.body + 20) : u32(b, mdhd.body + 12)) : 0;
     const hdlr = path(b, trak, ["mdia", "hdlr"]);
     const handler = hdlr ? typeAt(b, hdlr.body + 8) : "";
     const mvex = child(b, moov, "mvex");
@@ -65,7 +83,7 @@
         if (top[j].type === "mdat") end = top[j].end;
       }
       const tfdt = path(b, top[k], ["traf", "tfdt"]);
-      const time = tfdt ? (b[tfdt.body] === 1 ? u64(b, tfdt.body + 4) : u32(b, tfdt.body + 4)) : 0;
+      const time = tfdt ? (byteAt(b, tfdt.body) === 1 ? u64(b, tfdt.body + 4) : u32(b, tfdt.body + 4)) : 0;
       frags.push({ start: top[k].start, end, moof: top[k], time });
     }
     return { b, ftyp, moov, trak, timescale, handler, mvex, frags, mdats: top.filter((x) => x.type === "mdat"),
@@ -77,7 +95,7 @@
   function setTrackId(box, b, id) {
     // tkhd / trex / tfhd carry the id right after their version/flags (tkhd
     // after its times).
-    if (box.type === "tkhd") put32(b, box.body + (b[box.body] === 1 ? 20 : 12), id);
+    if (box.type === "tkhd") put32(b, box.body + (byteAt(b, box.body) === 1 ? 20 : 12), id);
     else put32(b, box.body + 4, id);
   }
 
@@ -116,13 +134,13 @@
   function mergedMvhd(v, a) {
     const b = copy(v.b, v.mvhd);
     const off = 8;
-    const v1 = b[off] === 1;
+    const v1 = byteAt(b, off) === 1;
     const tsAt = off + (v1 ? 20 : 12);
     const ts = u32(b, tsAt);
     const durOf = (p) => {
       const m = p.mvhd;
       if (!m) return 0;
-      const one = p.b[m.body] === 1;
+      const one = byteAt(p.b, m.body) === 1;
       const pts = u32(p.b, m.body + (one ? 20 : 12));
       const d = one ? u64(p.b, m.body + 24) : u32(p.b, m.body + 16);
       return pts ? d / pts : 0;
@@ -163,13 +181,13 @@
         if (tf & 0x20) { tFlags = u32(b, at); at += 4; }
         const tfdt = child(b, traf, "tfdt");
         if (tfdt) {
-          const start = b[tfdt.body] === 1 ? u64(b, tfdt.body + 4) : u32(b, tfdt.body + 4);
+          const start = byteAt(b, tfdt.body) === 1 ? u64(b, tfdt.body + 4) : u32(b, tfdt.body + 4);
           if (start > time && samples.length) samples[samples.length - 1].dur += start - time;
           time = Math.max(time, start);
         }
         let ptr = base;
         for (const trun of boxes(b, traf.body, traf.end).filter((x) => x.type === "trun")) {
-          const version = b[trun.body];
+          const version = byteAt(b, trun.body);
           const rf = u32(b, trun.body) & 0xffffff;
           const n = u32(b, trun.body + 4);
           let q = trun.body + 8;
@@ -241,7 +259,7 @@
 
   // tkhd/mdhd/mvhd durations: 32-bit in version 0, 64-bit in version 1.
   function setDuration(b, at32, at64, value) {
-    if (b[8] === 1) put64(b, at64, value); else put32(b, at32, Math.min(value, 0xffffffff));
+    if (byteAt(b, 8) === 1) put64(b, at64, value); else put32(b, at32, Math.min(value, 0xffffffff));
   }
 
   // The track's trak with its new id, durations and sample table. An edit
@@ -295,7 +313,7 @@
     for (const tr of tracks) tr.t.chunks.forEach((c, k) => order.push({ tr, k, t: c.t }));
     order.sort((x, y) => x.t - y.t || x.tr.id - y.tr.id);
     const mediaSize = order.reduce((n, o) => n + o.tr.t.chunks[o.k].bytes, 0);
-    const movieScale = (v.mvhd && u32(v.b, v.mvhd.body + (v.b[v.mvhd.body] === 1 ? 20 : 12))) || 1000;
+    const movieScale = (v.mvhd && u32(v.b, v.mvhd.body + (byteAt(v.b, v.mvhd.body) === 1 ? 20 : 12))) || 1000;
     const ftyp = box("ftyp", new Uint8Array([105, 115, 111, 109]), be32(512),
       new Uint8Array([105, 115, 111, 109, 105, 115, 111, 50, 97, 118, 99, 49, 109, 112, 52, 49]));
     const mdatHead = mediaSize + 8 > 0xffffffff ? 16 : 8;

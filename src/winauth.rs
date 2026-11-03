@@ -8,6 +8,7 @@
 
 use crate::engine::{EngineOpts, SharedState};
 use anyhow::{anyhow, Result};
+#[cfg(windows)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -38,6 +39,7 @@ pub async fn download(url: &str, dest: &std::path::Path, opts: &EngineOpts, shar
 }
 
 /// Where the partial file lives while WinHTTP downloads.
+#[cfg(windows)]
 fn part_path(dest: &std::path::Path) -> std::path::PathBuf {
     dest.with_extension("dcwin")
 }

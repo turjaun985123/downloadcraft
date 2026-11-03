@@ -26,6 +26,6 @@ platforms:
   - Windows
 status: experimental
 compatibility: targeting
-description: Independent offline-first download manager with segmented multi-connection downloads, resume via HTTP Range, queue with scheduler, speed limit, browser native-messaging integration, clipboard monitoring, and egui GUI plus CLI.
+description: Independent offline-first download manager with segmented multi-connection downloads, resume via HTTP Range, queue with scheduler, speed limit, browser native-messaging integration, clipboard monitoring, and native GPUI GUI plus CLI.
 license: MIT
 limitations: Early version, Windows-focused, streaming-site video extraction is basic.

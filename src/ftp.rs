@@ -253,6 +253,36 @@ async fn cmd<W: AsyncWrite + Unpin, R: AsyncBufRead + Unpin>(w: &mut W, r: &mut 
     read_reply(r).await
 }
 
+/// Control replies may stall independently of the data socket. Apply the
+/// normal FTP timeout while also making the wait pause/stop aware.
+async fn cmd_live<W: AsyncWrite + Unpin, R: AsyncBufRead + Unpin>(
+    shared: &SharedState,
+    w: &mut W,
+    r: &mut R,
+    line: &str,
+    timeout_secs: u64,
+) -> Result<(u32, String)> {
+    crate::engine::until_cancel(
+        shared,
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd(w, r, line)),
+    )
+    .await?
+    .map_err(|_| anyhow!("ftp control command timed out ({timeout_secs}s)"))?
+}
+
+/// QUIT is cleanup only: bound it and let Stop interrupt it without waiting
+/// for a silent server to acknowledge shutdown.
+async fn quit_best_effort<W: AsyncWrite + Unpin, R: AsyncBufRead + Unpin>(
+    shared: &SharedState,
+    w: &mut W,
+    r: &mut R,
+) {
+    tokio::select! {
+        _ = shared.cancelled() => {},
+        _ = tokio::time::timeout(std::time::Duration::from_millis(300), cmd(w, r, "QUIT")) => {},
+    }
+}
+
 fn parse_pasv(text: &str) -> Result<(String, u16)> {
     let s = text.find('(').and_then(|a| text[a + 1..].find(')').map(|b| text[a + 1..a + 1 + b].to_string()));
     let s = s.ok_or_else(|| anyhow!("ftp server sent an unparseable PASV reply"))?;
@@ -326,10 +356,15 @@ async fn download_ftp_single(
 
     // Control connection with a connect timeout (a blackhole host must not
     // hang the queue forever), login, binary mode.
-    let (mut r, mut w) = ftp_login(&t, connect_to).await?;
+    let (mut r, mut w) = crate::engine::until_cancel(
+        shared.as_ref(),
+        tokio::time::timeout(std::time::Duration::from_secs(connect_to), ftp_login(&t, connect_to)),
+    )
+    .await?
+    .map_err(|_| anyhow!("ftp login timed out ({connect_to}s)"))??;
     // SIZE is optional (some servers hide it): unknown total still streams.
     let mut total: Option<u64> = None;
-    let (code, text) = cmd(&mut w, &mut r, &format!("SIZE {}", t.path)).await?;
+    let (code, text) = cmd_live(shared.as_ref(), &mut w, &mut r, &format!("SIZE {}", t.path), connect_to).await?;
     if code == 213 {
         total = text.split_whitespace().last().and_then(|s| s.parse().ok());
     }
@@ -357,7 +392,6 @@ async fn download_ftp_single(
     loop {
         attempt += 1;
         if shared.cancelled.load(Ordering::SeqCst) {
-            let _ = cmd(&mut w, &mut r, "QUIT").await;
             return Err(anyhow!("cancelled"));
         }
         crate::engine::wait_if_paused(&shared).await?;
@@ -375,12 +409,12 @@ async fn download_ftp_single(
                             stalled = stalled.saturating_add(1);
                         }
                         if stalled >= max_retries || attempt >= max_retries * 20 {
-                            let _ = cmd(&mut w, &mut r, "QUIT").await;
+                            quit_best_effort(shared.as_ref(), &mut w, &mut r).await;
                             return Err(anyhow!(
                                 "connection ended early (got {got} of {tot} bytes) — resuming [{attempt} tries]"
                             ));
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+                        crate::engine::sleep_live(&shared, 1 << stalled.min(4)).await?;
                         continue;
                     }
                 }
@@ -388,7 +422,6 @@ async fn download_ftp_single(
             }
             Err(e) => {
                 if shared.cancelled.load(Ordering::SeqCst) || e.to_string() == "cancelled" {
-                    let _ = cmd(&mut w, &mut r, "QUIT").await;
                     return Err(e);
                 }
                 let msg = e.to_string();
@@ -413,7 +446,7 @@ async fn download_ftp_single(
                         crate::engine::resume_offset(dest, "dcpart", url, total, 1);
                         continue;
                     }
-                    let _ = cmd(&mut w, &mut r, "QUIT").await;
+                    quit_best_effort(shared.as_ref(), &mut w, &mut r).await;
                     return Err(e);
                 }
                 let len_after = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
@@ -423,10 +456,10 @@ async fn download_ftp_single(
                     stalled = stalled.saturating_add(1);
                 }
                 if stalled >= max_retries || attempt >= max_retries * 20 {
-                    let _ = cmd(&mut w, &mut r, "QUIT").await;
+                    quit_best_effort(shared.as_ref(), &mut w, &mut r).await;
                     return Err(anyhow!("{e:#} [{attempt} tries]"));
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+                crate::engine::sleep_live(&shared, 1 << stalled.min(4)).await?;
             }
         }
         // Completion check against SIZE when the server gave one.
@@ -440,7 +473,7 @@ async fn download_ftp_single(
             }
         }
     }
-    let _ = cmd(&mut w, &mut r, "QUIT").await;
+    quit_best_effort(shared.as_ref(), &mut w, &mut r).await;
     tokio::fs::rename(&tmp, dest).await.map_err(|e| anyhow!(io_message(&e)))?;
     if !opts.expected_sha256.trim().is_empty() {
         if let Err(e) = crate::engine::verify_checksum(dest, &opts.expected_sha256).await {
@@ -463,25 +496,35 @@ async fn transfer_once(
     shared: &Arc<SharedState>,
     limiter: &Arc<RateLimiter>,
 ) -> Result<bool> {
-    let (code, text) = cmd(w, r, "PASV").await?;
+    let (code, text) = cmd_live(shared, w, r, "PASV", stall_secs).await?;
     if !(200..300).contains(&code) {
         return Err(anyhow!("ftp PASV refused ({code} {text})"));
     }
     // Open the data connection as soon as PASV names it, before RETR: some
     // servers (vsftpd, ProFTPD) wait for it before sending "150", while we
     // used to wait for "150" before connecting, so both sides waited.
-    let data_tcp = open_data(t, &text).await?;
+    let data_tcp = crate::engine::until_cancel(
+        shared.as_ref(),
+        tokio::time::timeout(std::time::Duration::from_secs(stall_secs), open_data(t, &text)),
+    )
+    .await?
+    .map_err(|_| anyhow!("ftp data connect timed out ({stall_secs}s)"))??;
     if offset > 0 {
-        let (code, text) = cmd(w, r, &format!("REST {offset}")).await?;
+        let (code, text) = cmd_live(shared.as_ref(), w, r, &format!("REST {offset}"), stall_secs).await?;
         if !(300..400).contains(&code) {
             return Err(anyhow!("REST rejected ({code} {text}) — resuming from zero"));
         }
     }
-    let (code, text) = cmd(w, r, &format!("RETR {}", t.path)).await?;
+    let (code, text) = cmd_live(shared.as_ref(), w, r, &format!("RETR {}", t.path), stall_secs).await?;
     if !(100..200).contains(&code) {
         return Err(anyhow!("ftp retrieve refused ({code} {text})"));
     }
-    let mut data = start_data(t, data_tcp).await?;
+    let mut data = crate::engine::until_cancel(
+        shared.as_ref(),
+        tokio::time::timeout(std::time::Duration::from_secs(stall_secs), start_data(t, data_tcp)),
+    )
+    .await?
+    .map_err(|_| anyhow!("FTPS data handshake timed out ({stall_secs}s)"))??;
     #[allow(clippy::suspicious_open_options)]
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -496,8 +539,10 @@ async fn transfer_once(
         if shared.cancelled.load(Ordering::SeqCst) {
             return Err(anyhow!("cancelled"));
         }
-        let n = tokio::time::timeout(std::time::Duration::from_secs(stall_secs), data.read(&mut buf))
-            .await
+        let n = crate::engine::until_cancel(
+            shared.as_ref(),
+            tokio::time::timeout(std::time::Duration::from_secs(stall_secs), data.read(&mut buf)),
+        ).await?
             .map_err(|_| anyhow!("stalled (no data for {stall_secs}s) — resuming"))?
             .or_else(data_eof)
             .map_err(|e| anyhow!("ftp data: {e}"))?;
@@ -511,7 +556,7 @@ async fn transfer_once(
                 *slot = slot.saturating_add(n as u64);
             }
         }
-        limiter.consume(n as u64).await;
+        crate::engine::until_cancel(shared.as_ref(), limiter.consume(n as u64)).await?;
     }
     file.flush().await.map_err(|e| anyhow!(io_message(&e)))?;
     drop(file);
@@ -519,8 +564,10 @@ async fn transfer_once(
     // End-of-transfer reply (226/250/2xx), guarded so a silent server
     // can't hang the queue. A 426/550 here means the bytes above are
     // suspect — surface it instead of finalizing.
-    let (code, text) = tokio::time::timeout(std::time::Duration::from_secs(stall_secs), read_reply(r))
-        .await
+    let (code, text) = crate::engine::until_cancel(
+        shared.as_ref(),
+        tokio::time::timeout(std::time::Duration::from_secs(stall_secs), read_reply(r)),
+    ).await?
         .map_err(|_| anyhow!("stalled (no end-of-transfer reply for {stall_secs}s) — resuming"))??;
     if (200..300).contains(&code) {
         return Ok(true);
@@ -593,32 +640,49 @@ async fn ftp_part(
         crate::engine::wait_if_paused(&shared).await?;
         let before = done.load(Ordering::SeqCst);
         let attempt: Result<()> = async {
-            let (mut r, mut w) = ftp_login(&t, connect_to).await?;
-            let (code, text) = cmd(&mut w, &mut r, "PASV").await?;
+            let (mut r, mut w) = crate::engine::until_cancel(
+                shared.as_ref(),
+                tokio::time::timeout(std::time::Duration::from_secs(connect_to), ftp_login(&t, connect_to)),
+            )
+            .await?
+            .map_err(|_| anyhow!("ftp login timed out ({connect_to}s)"))??;
+            let (code, text) = cmd_live(shared.as_ref(), &mut w, &mut r, "PASV", stall_secs).await?;
             if !(200..300).contains(&code) {
                 return Err(anyhow!("ftp PASV refused ({code} {text})"));
             }
-            let data_tcp = open_data(&t, &text).await?;
+            let data_tcp = crate::engine::until_cancel(
+                shared.as_ref(),
+                tokio::time::timeout(std::time::Duration::from_secs(connect_to), open_data(&t, &text)),
+            )
+            .await?
+            .map_err(|_| anyhow!("ftp data connect timed out ({connect_to}s)"))??;
             let at = start + done.load(Ordering::SeqCst);
             if at > 0 {
-                let (code, text) = cmd(&mut w, &mut r, &format!("REST {at}")).await?;
+                let (code, text) = cmd_live(shared.as_ref(), &mut w, &mut r, &format!("REST {at}"), stall_secs).await?;
                 if !(300..400).contains(&code) {
                     return Err(anyhow!("REST rejected ({code} {text})"));
                 }
             }
-            let (code, text) = cmd(&mut w, &mut r, &format!("RETR {}", t.path)).await?;
+            let (code, text) = cmd_live(shared.as_ref(), &mut w, &mut r, &format!("RETR {}", t.path), stall_secs).await?;
             if !(100..200).contains(&code) {
                 return Err(anyhow!("ftp retrieve refused ({code} {text})"));
             }
-            let mut sock = start_data(&t, data_tcp).await?;
+            let mut sock = crate::engine::until_cancel(
+                shared.as_ref(),
+                tokio::time::timeout(std::time::Duration::from_secs(stall_secs), start_data(&t, data_tcp)),
+            )
+            .await?
+            .map_err(|_| anyhow!("FTPS data handshake timed out ({stall_secs}s)"))??;
             let mut file = tokio::fs::OpenOptions::new().write(true).open(&data).await.map_err(|e| anyhow!(io_message(&e)))?;
             file.seek(std::io::SeekFrom::Start(at)).await?;
             let mut buf = vec![0u8; 64 * 1024];
             while done.load(Ordering::SeqCst) < len {
                 crate::engine::wait_if_paused(&shared).await?;
                 let want = ((len - done.load(Ordering::SeqCst)) as usize).min(buf.len());
-                let n = tokio::time::timeout(std::time::Duration::from_secs(stall_secs), sock.read(&mut buf[..want]))
-                    .await
+                let n = crate::engine::until_cancel(
+                    shared.as_ref(),
+                    tokio::time::timeout(std::time::Duration::from_secs(stall_secs), sock.read(&mut buf[..want])),
+                ).await?
                     .map_err(|_| anyhow!("stalled (no data for {stall_secs}s)"))?
                     .or_else(data_eof)
             .map_err(|e| anyhow!("ftp data: {e}"))?;
@@ -633,13 +697,13 @@ async fn ftp_part(
                         *slot = done.load(Ordering::SeqCst);
                     }
                 }
-                limiter.consume(n as u64).await;
+                crate::engine::until_cancel(shared.as_ref(), limiter.consume(n as u64)).await?;
             }
             file.flush().await?;
             // The part is complete (or the server stopped): close the data
             // connection early and leave; the server's 426 is expected.
             drop(sock);
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), cmd(&mut w, &mut r, "QUIT")).await;
+            quit_best_effort(shared.as_ref(), &mut w, &mut r).await;
             Ok(())
         }
         .await;
@@ -655,7 +719,7 @@ async fn ftp_part(
                 return Err(attempt.err().unwrap_or_else(|| anyhow!("ftp part {idx} made no progress")));
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1 << stalled.min(4))).await;
+        crate::engine::sleep_live(&shared, 1 << stalled.min(4)).await?;
     }
     Ok(())
 }
@@ -671,9 +735,15 @@ async fn try_segmented_ftp(
     limiter: &Arc<RateLimiter>,
 ) -> Result<bool> {
     let t = Arc::new(parse_target(url)?);
-    let (mut r, mut w) = ftp_login(&t, opts.timeout_secs.clamp(5, 120)).await?;
-    let (code, text) = cmd(&mut w, &mut r, &format!("SIZE {}", t.path)).await?;
-    let _ = cmd(&mut w, &mut r, "QUIT").await;
+    let connect_to = opts.timeout_secs.clamp(5, 120);
+    let (mut r, mut w) = crate::engine::until_cancel(
+        shared.as_ref(),
+        tokio::time::timeout(std::time::Duration::from_secs(connect_to), ftp_login(&t, connect_to)),
+    )
+    .await?
+    .map_err(|_| anyhow!("ftp login timed out ({connect_to}s)"))??;
+    let (code, text) = cmd_live(shared.as_ref(), &mut w, &mut r, &format!("SIZE {}", t.path), connect_to).await?;
+    quit_best_effort(shared.as_ref(), &mut w, &mut r).await;
     let total: u64 = if code == 213 { text.split_whitespace().last().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 };
     const MIN_PART: u64 = 2 * 1024 * 1024;
     if total < 2 * MIN_PART {

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use downloadcraft_engine::zip::{extract_remote, list_remote};
+use downloadcraft_engine::zip::{extract_remote, list_remote, list_remote_with_limits, ZipLimits};
 use downloadcraft_engine::RequestFn;
 
 /// A ZIP with one stored and one deflated file.
@@ -92,6 +92,59 @@ async fn serve(body: Vec<u8>) -> String {
         }
     });
     base
+}
+
+fn unique_dir(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("dce-zip-{}-{tag}-{nanos}", std::process::id()))
+}
+
+#[tokio::test]
+async fn a_lying_entry_size_cannot_expand_past_its_declared_bytes() {
+    // 2 MiB of zeros compress to a few hundred bytes, but the directory says
+    // the entry is only 1 KiB: extraction must stop at 1 KiB, not fill disk.
+    let data = vec![0u8; 2 * 1024 * 1024];
+    let mut zip = make_zip(&[("bomb.bin", &data, true)]);
+    let dir_at = zip.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    zip[dir_at + 24..dir_at + 28].copy_from_slice(&1024u32.to_le_bytes());
+    let url = serve(zip).await;
+    let client = reqwest::Client::new();
+    let request: RequestFn = Arc::new(move |u: &str| client.get(u));
+    let entries = list_remote(&request, &url).await.unwrap();
+    assert_eq!(entries[0].size, 1024);
+
+    let dir = unique_dir("lying");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = dir.join("bomb.bin");
+    std::fs::write(&dest, b"old bytes").unwrap();
+    let err = extract_remote(&request, &url, &entries[0], &dest).await.unwrap_err();
+    assert!(err.to_string().contains("limit"), "{err}");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"old bytes", "old file must survive");
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".dczip-"))
+        .collect();
+    assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_huge_directory_claim_is_refused_before_it_is_fetched() {
+    let mut zip = make_zip(&[("a.txt", b"hello", false)]);
+    let eocd = zip.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+    // Keep this a normal ZIP directory declaration and exercise the caller's
+    // configured limit before the parser validates its archive offset.
+    zip[eocd + 12..eocd + 16].copy_from_slice(&64u32.to_le_bytes());
+    let url = serve(zip).await;
+    let client = reqwest::Client::new();
+    let request: RequestFn = Arc::new(move |u: &str| client.get(u));
+    let limits = ZipLimits { max_directory_size: 32, ..ZipLimits::default() };
+    let err = list_remote_with_limits(&request, &url, limits).await.unwrap_err();
+    assert!(err.to_string().contains("directory is"), "{err}");
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, Timelike};
+use chrono::{DateTime, Local};
 
 /// Public application version. Keep this aligned with Cargo and extension manifests.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -56,7 +56,13 @@ impl FsGuard {
     }
 }
 pub fn fs_lock(name: &str) -> FsGuard {
-    fn acquire(name: &str) -> Option<std::fs::File> {
+    fs_lock_timeout(name, std::time::Duration::from_secs(2))
+}
+
+/// Acquire a shared state lock for at most `timeout`. Shutdown uses this
+/// bounded variant so another short-lived helper cannot hold the GUI open.
+pub fn fs_lock_timeout(name: &str, timeout: std::time::Duration) -> FsGuard {
+    fn acquire(name: &str, timeout: std::time::Duration) -> Option<std::fs::File> {
         let path = config_dir()?.join(format!("{name}.lock"));
         std::fs::create_dir_all(path.parent()?).ok()?;
         let file = std::fs::OpenOptions::new()
@@ -66,19 +72,23 @@ pub fn fs_lock(name: &str) -> FsGuard {
             .truncate(false)
             .open(path)
             .ok()?;
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
             match file.try_lock() {
                 Ok(()) => return Some(file),
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return None;
+                    }
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
                 }
                 Err(_) => return None,
             }
         }
-        None
     }
     FsGuard {
-        _file: acquire(name),
+        _file: acquire(name, timeout),
     }
 }
 
@@ -92,13 +102,63 @@ pub fn touch_heartbeat() {
         }
         let _ = std::fs::write(&p, chrono::Local::now().to_rfc3339());
     }
+    set_app_lifecycle("running");
 }
 
 /// The main window is closing: say so at once, so a capture dialog opened
 /// right after does not take the app for running.
 pub fn clear_heartbeat() {
+    set_app_lifecycle("closing");
     if let Some(p) = config_dir().map(|d| d.join("main.lock")) {
         let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Persist the GUI lifecycle separately from native-host availability.
+pub fn set_app_lifecycle(state: &str) {
+    if !matches!(state, "starting" | "running" | "closing") {
+        return;
+    }
+    let Some(path) = config_dir().map(|d| d.join("app_lifecycle.json")) else {
+        return;
+    };
+    let body = serde_json::json!({
+        "state": state,
+        "at": chrono::Local::now().to_rfc3339(),
+    });
+    if let Ok(bytes) = serde_json::to_vec(&body) {
+        let _ = atomic_write(&path, &bytes);
+    }
+}
+
+/// Fresh GUI state for the extension: the native host itself can stay alive
+/// while the desktop window is closed.
+pub fn app_lifecycle_state() -> String {
+    let Some(path) = config_dir().map(|d| d.join("app_lifecycle.json")) else {
+        return "not_running".into();
+    };
+    let Some(value) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return if is_main_live() { "running" } else { "not_running" }.into();
+    };
+    let state = value.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    let at = value
+        .get("at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+    let Some(at) = at else {
+        return if is_main_live() { "running" } else { "not_running" }.into();
+    };
+    let age = chrono::Local::now().timestamp() - at.timestamp();
+    if age < -5 || age > 12 {
+        return "not_running".into();
+    }
+    if matches!(state, "starting" | "running" | "closing") {
+        state.into()
+    } else {
+        "not_running".into()
     }
 }
 
@@ -212,33 +272,6 @@ pub struct DownloadItem {
     /// Named queue this row belongs to; empty = the Main queue.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub queue: String,
-}
-
-/// A named queue besides Main (IDM: several queues, each with its own
-/// schedule and number of simultaneous downloads).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct QueueDef {
-    pub name: String,
-    /// Downloads at the same time.
-    pub max: usize,
-    /// Start / stop by itself at this local time ("HH:MM"; empty = never).
-    #[serde(default)]
-    pub start_at: String,
-    #[serde(default)]
-    pub stop_at: String,
-    /// Check finished files for a newer version on the server every N hours
-    /// (0 = never) and download the changed ones again (IDM's queue sync).
-    #[serde(default)]
-    pub sync_hours: u64,
-    #[serde(skip)]
-    pub running: bool,
-    /// Date the start / stop time last fired (once a day each).
-    #[serde(skip)]
-    pub fired_start: String,
-    #[serde(skip)]
-    pub fired_stop: String,
-    #[serde(skip)]
-    pub last_sync: Option<std::time::Instant>,
 }
 
 /// "https://a/f.iso | https://b/f.iso": the first is the download, the rest
@@ -366,20 +399,6 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Standard base64 with padding.
-pub fn base64_encode(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
-
 impl DownloadItem {
     pub fn new(id: u64, url: String, filename: String, save_dir: String, connections: usize) -> Self {
         Self {
@@ -441,26 +460,6 @@ impl DownloadItem {
         }
     }
 
-    pub fn category(&self) -> &'static str {
-        category_of(&self.filename)
-    }
-}
-
-/// Queue v2: whether a row's "start at" time has arrived. Blank = now.
-/// A time already past also means now (set it and it runs), and an
-/// unparsable value never blocks a download forever.
-pub fn start_at_due(s: &str, now: DateTime<Local>) -> bool {
-    let t = s.trim();
-    if t.is_empty() {
-        return true;
-    }
-    match parse_hhmm(t) {
-        Some(mins) => {
-            let now_secs = now.hour() * 3600 + now.minute() * 60 + now.second();
-            mins as u32 * 60 <= now_secs
-        }
-        None => true,
-    }
 }
 
 pub fn category_of(filename: &str) -> &'static str {    let ext = filename
@@ -687,83 +686,35 @@ pub fn claim_window(name: &str) -> Option<std::fs::File> {
     Some(file)
 }
 
-/// The monitor's work area in points: the desktop minus the taskbar (and any
-/// other docked bar), so a window centred inside it can never end up half
-/// behind the taskbar. Falls back to the whole monitor when the work area is
-/// not known yet.
-pub fn work_area_rect(ctx: &egui::Context) -> Option<egui::Rect> {
-    let monitor = ctx.input(|i| i.viewport().monitor_size);
+/// Check whether another process currently owns a standalone-window slot.
+/// The probe's file handle is dropped before this function returns.
+pub fn window_is_claimed(name: &str) -> bool {
+    let dir = match config_dir() {
+        Some(dir) => dir.join("win"),
+        None => return false,
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
     #[cfg(windows)]
     {
-        let scale = ctx
-            .input(|i| i.viewport().native_pixels_per_point)
-            .filter(|s| *s > 0.05);
-        if let (Some(scale), Some((l, t, r, b))) = (scale, primary_work_area_px()) {
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(l / scale, t / scale),
-                egui::pos2(r / scale, b / scale),
-            );
-            // egui reports monitor_size in points; if the scaled work area
-            // disagrees with it wildly the scale factor was wrong (mixed DPI),
-            // so prefer the monitor rectangle in that case.
-            let plausible = match monitor {
-                Some(m) => {
-                    rect.width() > m.x * 0.25
-                        && rect.width() < m.x * 2.5
-                        && rect.height() > m.y * 0.25
-                        && rect.height() < m.y * 2.5
-                }
-                None => rect.width() > 200.0 && rect.height() > 200.0,
-            };
-            if plausible {
-                return Some(rect);
-            }
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+        opts.open(dir.join(name)).is_err()
+    }
+    #[cfg(unix)]
+    {
+        let Ok(file) = opts.open(dir.join(name)) else {
+            return false;
+        };
+        match file.try_lock() {
+            Ok(()) => false,
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(_) => false,
         }
     }
-    monitor.map(|m| egui::Rect::from_min_size(egui::Pos2::ZERO, m))
-}
-
-/// `SPI_GETWORKAREA` of the primary monitor, in physical pixels.
-#[cfg(windows)]
-fn primary_work_area_px() -> Option<(f32, f32, f32, f32)> {
-    #[repr(C)]
-    struct Rect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    }
-    const SPI_GETWORKAREA: u32 = 0x0030;
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn SystemParametersInfoW(
-            action: u32,
-            param: u32,
-            data: *mut std::ffi::c_void,
-            win_ini: u32,
-        ) -> i32;
-    }
-    let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
-    let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut _ as *mut _, 0) };
-    (ok != 0).then(|| (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32))
-}
-
-/// Put a fixed-size window in the middle of the work area. Returns `false`
-/// while the monitor geometry is still unknown so callers retry next frame
-/// instead of latching a bad position (Windows cascades otherwise).
-pub fn center_window(ctx: &egui::Context, size: egui::Vec2) -> bool {
-    let Some(work) = work_area_rect(ctx) else {
-        return false;
-    };
-    if work.width() < 120.0 || work.height() < 120.0 {
-        return false;
-    }
-    // Clamp to the top-left corner: a window taller than the work area should
-    // hug the top edge rather than run off the bottom.
-    let x = (work.center().x - size.x / 2.0).max(work.min.x);
-    let y = (work.center().y - size.y / 2.0).max(work.min.y);
-    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
-    true
 }
 
 /// Read a boolean preference out of ui.json (the main app's settings file)
@@ -785,6 +736,46 @@ pub fn ui_pref_str(key: &str, default: &str) -> String {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get(key).and_then(|x| x.as_str()).map(str::to_string))
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Read a numeric preference from ui.json, with a default for older configs.
+pub fn ui_pref_u64(key: &str, default: u64) -> u64 {
+    config_dir()
+        .and_then(|p| std::fs::read_to_string(p.join("ui.json")).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get(key).and_then(|x| x.as_u64()))
+        .unwrap_or(default)
+}
+
+/// Read a structured preference from ui.json for migrated GPUI settings.
+pub fn ui_pref_value(key: &str) -> Option<serde_json::Value> {
+    config_dir()
+        .and_then(|path| std::fs::read_to_string(path.join("ui.json")).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get(key).cloned())
+}
+
+/// Merge a structured preference into ui.json while preserving settings
+/// written by the main window or another settings page.
+pub fn ui_pref_set_value(key: &str, value: serde_json::Value) {
+    let guard = fs_lock("ui-settings");
+    if !guard.owned() {
+        return;
+    }
+    let Some(path) = config_dir().map(|dir| dir.join("ui.json")) else {
+        return;
+    };
+    let mut stored: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(object) = stored.as_object_mut() else {
+        return;
+    };
+    object.insert(key.to_string(), value);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
+        let _ = atomic_write(&path, &bytes);
+    }
 }
 
 /// Merge one boolean into ui.json, leaving every other key alone. The main app
@@ -811,6 +802,10 @@ pub fn ui_pref_set_bool(key: &str, value: bool) {
 /// Merge one string into ui.json (used when an action commits a helper choice
 /// right away, e.g. "Re-download" switching to the app's own ffmpeg).
 pub fn ui_pref_set_str(key: &str, value: &str) {
+    let _guard = fs_lock("ui-settings");
+    if !_guard.owned() {
+        return;
+    }
     let Some(p) = config_dir().map(|d| d.join("ui.json")) else {
         return;
     };
@@ -824,6 +819,30 @@ pub fn ui_pref_set_str(key: &str, value: &str) {
     obj.insert(key.to_string(), serde_json::Value::String(value.to_string()));
     if let Ok(json) = serde_json::to_string_pretty(&v) {
         let _ = atomic_write(&p, json.as_bytes());
+    }
+}
+
+/// Merge a numeric preference into ui.json without replacing settings written
+/// by another window. GPUI's settings view and the legacy settings window use
+/// the same lock and file format during the UI migration.
+pub fn ui_pref_set_u64(key: &str, value: u64) {
+    let _guard = fs_lock("ui-settings");
+    if !_guard.owned() {
+        return;
+    }
+    let Some(path) = config_dir().map(|dir| dir.join("ui.json")) else {
+        return;
+    };
+    let mut value_json: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(object) = value_json.as_object_mut() else {
+        return;
+    };
+    object.insert(key.to_string(), serde_json::Value::from(value));
+    if let Ok(bytes) = serde_json::to_vec_pretty(&value_json) {
+        let _ = atomic_write(&path, &bytes);
     }
 }
 
@@ -1118,34 +1137,6 @@ fn protect(data: &[u8], _encrypt: bool) -> Option<Vec<u8>> {
 }
 
 /// The saved logins (passwords decrypted).
-/// A saved Site Grabber setup (IDM's grabber projects): run it again later
-/// to pick up what the site added.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct GrabProject {
-    pub name: String,
-    pub url: String,
-    pub exts: String,
-    pub follow: bool,
-    pub levels: usize,
-    pub stay: bool,
-}
-
-fn grab_projects_path() -> Option<std::path::PathBuf> {
-    config_dir().map(|d| d.join("grab_projects.json"))
-}
-
-pub fn grab_projects() -> Vec<GrabProject> {
-    grab_projects_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_grab_projects(list: &[GrabProject]) -> bool {
-    let Some(p) = grab_projects_path() else { return false };
-    serde_json::to_string_pretty(list).ok().is_some_and(|j| std::fs::write(p, j).is_ok())
-}
-
 pub fn site_logins() -> Vec<SiteLogin> {
     let stored: Vec<StoredLogin> = logins_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -1160,29 +1151,6 @@ pub fn site_logins() -> Vec<SiteLogin> {
         .collect()
 }
 
-/// Save the logins (passwords protected for this user).
-pub fn save_site_logins(list: &[SiteLogin]) -> bool {
-    let Some(p) = logins_path() else { return false };
-    let stored: Vec<StoredLogin> = list
-        .iter()
-        .filter(|l| !l.host.trim().is_empty() && !l.user.trim().is_empty())
-        .filter_map(|l| {
-            Some(StoredLogin {
-                host: l.host.trim().trim_start_matches("*.").to_ascii_lowercase(),
-                user: l.user.trim().to_string(),
-                pass: base64_encode(&protect(l.pass.as_bytes(), true)?),
-            })
-        })
-        .collect();
-    let ok = serde_json::to_string_pretty(&stored).ok().is_some_and(|j| atomic_write(&p, j.as_bytes()).is_ok());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
-    ok
-}
-
 /// The saved login for `url`'s host (or a parent domain), if any.
 pub fn login_for(url: &str) -> Option<(String, String)> {
     let host = url::Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
@@ -1191,50 +1159,6 @@ pub fn login_for(url: &str) -> Option<(String, String)> {
         .filter(|l| host == l.host || host.ends_with(&format!(".{}", l.host)))
         .max_by_key(|l| l.host.len())
         .map(|l| (l.user, l.pass))
-}
-
-// ---- refresh download address (IDM) ----------------------------------------
-
-/// "Refresh download address": row `id` waits (until `until`, unix seconds)
-/// for the next link the browser extension sends, which then replaces its
-/// expired link instead of opening a new download.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RefreshWait {
-    pub id: u64,
-    pub until: i64,
-}
-
-fn refresh_wait_path() -> Option<std::path::PathBuf> {
-    config_dir().map(|d| d.join("refresh_wait.json"))
-}
-
-/// The row waiting for a fresh link, if the wait has not run out.
-pub fn refresh_wait() -> Option<RefreshWait> {
-    let w: RefreshWait = serde_json::from_str(&std::fs::read_to_string(refresh_wait_path()?).ok()?).ok()?;
-    (w.until > Local::now().timestamp()).then_some(w)
-}
-
-/// Start (Some) or end (None) a wait for a fresh link.
-pub fn set_refresh_wait(w: Option<RefreshWait>) {
-    let Some(p) = refresh_wait_path() else { return };
-    match w {
-        Some(w) => {
-            let _ = atomic_write(&p, serde_json::to_string(&w).unwrap_or_default().as_bytes());
-        }
-        None => {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
-/// Bind `dest`'s single-stream resume state to a new URL for the same file
-/// (a refreshed link), so the bytes already on disk are kept.
-pub fn rebind_resume(dest: &std::path::Path, new_url: &str) {
-    let meta = dest.with_extension("dcmeta");
-    if let Some(mut v) = std::fs::read_to_string(&meta).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
-        v["url"] = serde_json::Value::from(new_url);
-        let _ = std::fs::write(&meta, v.to_string());
-    }
 }
 
 /// Outcome of `append_to_queue`.
@@ -1484,55 +1408,6 @@ fn append_to_queue_at(path: &std::path::Path, item: &mut DownloadItem) -> Append
     }
 }
 
-/// A daily speed window (P3.4): HH:MM–HH:MM at `limit_kbps` (0 = full speed).
-/// Overnight ranges (22:00–06:00) wrap midnight.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpeedWindow {
-    #[serde(default = "SpeedWindow::d02")]
-    pub start: String,
-    #[serde(default = "SpeedWindow::d06")]
-    pub end: String,
-    #[serde(default)]
-    pub limit_kbps: u64,
-}
-
-impl SpeedWindow {
-    fn d02() -> String {
-        "02:00".to_string()
-    }
-    fn d06() -> String {
-        "06:00".to_string()
-    }
-    pub fn start_min(&self) -> Option<u16> {
-        parse_hhmm(&self.start)
-    }
-    pub fn end_min(&self) -> Option<u16> {
-        parse_hhmm(&self.end)
-    }
-    pub fn active_at(&self, now_min: u16) -> bool {
-        match (self.start_min(), self.end_min()) {
-            (Some(s), Some(e)) => {
-                if s <= e {
-                    now_min >= s && now_min < e
-                } else {
-                    now_min >= s || now_min < e
-                }
-            }
-            _ => false,
-        }
-    }
-}
-
-pub fn parse_hhmm(s: &str) -> Option<u16> {
-    let (h, m) = s.trim().split_once(':')?;
-    let h: u16 = h.parse().ok()?;
-    let m: u16 = m.parse().ok()?;
-    if h > 23 || m > 59 {
-        return None;
-    }
-    Some(h * 60 + m)
-}
-
 /// True when `latest` is newer than `current` (`v` prefix + whitespace OK).
 pub fn is_newer_version(current: &str, latest: &str) -> bool {
     fn parts(s: &str) -> Vec<u64> {
@@ -1578,38 +1453,19 @@ pub fn pick_windows_asset(v: &serde_json::Value) -> Option<String> {
         let l = n.to_ascii_lowercase();
         l.contains("x86_64") || l.contains("x64")
     };
-    // Portable build first, then any 64-bit windows zip, then any windows
-    // zip, then any zip at all.
+    // Portable build first, then any 64-bit Windows zip, then any Windows
+    // zip. A Linux/macOS or source zip is never installed on Windows.
     let portable = names
         .iter()
         .find(|(n, _)| is_zip(n) && is_win(n) && n.to_ascii_lowercase().contains("portable"));
     let win64 = names.iter().find(|(n, _)| is_zip(n) && is_win(n) && is_64(n));
     let win = names.iter().find(|(n, _)| is_zip(n) && is_win(n));
-    let any = names.iter().find(|(n, _)| is_zip(n));
-    portable
-        .or(win64)
-        .or(win)
-        .or(any)
-        .map(|(_, u)| u.to_string())
+    portable.or(win64).or(win).map(|(_, u)| u.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn queue_start_times() {
-        use chrono::TimeZone;
-        let at = |h, m| Local.with_ymd_and_hms(2026, 10, 21, h, m, 0).unwrap();
-        // Blank means now; a time already past also means now.
-        assert!(start_at_due("", at(10, 0)));
-        assert!(start_at_due("08:30", at(10, 0)));
-        assert!(start_at_due("10:00", at(10, 0)));
-        // A later clock time holds the row back.
-        assert!(!start_at_due("23:30", at(10, 0)));
-        // Garbage never blocks a download forever.
-        assert!(start_at_due("later", at(10, 0)));
-    }
 
     #[test]
     fn categories() {
@@ -2011,17 +1867,6 @@ mod tests {
 
     #[test]
     fn windows_and_versions() {
-        assert_eq!(parse_hhmm("02:00"), Some(120));
-        assert_eq!(parse_hhmm("23:59"), Some(1439));
-        assert_eq!(parse_hhmm("24:00"), None);
-        assert_eq!(parse_hhmm("abc"), None);
-        let w = SpeedWindow { start: "22:00".into(), end: "06:00".into(), limit_kbps: 0 };
-        assert!(w.active_at(23 * 60));
-        assert!(w.active_at(5 * 60));
-        assert!(!w.active_at(12 * 60));
-        let d = SpeedWindow { start: "02:00".into(), end: "06:00".into(), limit_kbps: 0 };
-        assert!(d.active_at(3 * 60));
-        assert!(!d.active_at(7 * 60));
         assert!(is_newer_version("0.6.0", "v0.7.0"));
         assert!(!is_newer_version("0.7.0", "0.6.0"));
         assert!(!is_newer_version("0.6.0", "0.6.0"));
@@ -2053,22 +1898,6 @@ mod tests {
         let v3: serde_json::Value = serde_json::json!({"assets": []});
         assert_eq!(pick_windows_asset(&v3), None);
         assert_eq!(pick_windows_asset(&serde_json::json!({})), None);
-    }
-}
-
-/// Overlay only fields owned by this writer, preserving plugin preferences.
-pub fn merge_ui_values(mut current:serde_json::Value,patch:serde_json::Value)->serde_json::Value {
-    if !current.is_object(){current=serde_json::json!({});}
-    if let (Some(target),Some(changes))=(current.as_object_mut(),patch.as_object()) {
-        for (key,value) in changes {target.insert(key.clone(),value.clone());}
-    }
-    current
-}
-#[cfg(test)]
-mod preference_merge_tests {
-    #[test]fn main_window_save_keeps_helper_locations(){
-        let saved=super::merge_ui_values(serde_json::json!({"ytdlp_source":"custom","ytdlp_custom_path":"/home/user/yt-dlp","ffmpeg_custom_path":"/home/user/ffmpeg","theme":"dark"}),serde_json::json!({"columns":["name"],"theme":"light"}));
-        assert_eq!(saved["ytdlp_source"],"custom");assert_eq!(saved["ffmpeg_custom_path"],"/home/user/ffmpeg");assert_eq!(saved["theme"],"light");
     }
 }
 
@@ -2105,71 +1934,6 @@ mod audit_private_state_tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(),1);
         std::fs::remove_dir_all(dir).unwrap();
     }
-}
-
-// ---- batch download patterns (IDM "Add batch download") --------------------
-
-/// Expand `https://site/img[001-120].jpg` (or `(001-120)`, `[a-z]`) into
-/// every URL it names. Several groups multiply. Numbers keep the width of the
-/// first bound (001, 002, …). None when the text holds no range or would
-/// produce more than 10,000 URLs.
-pub fn expand_batch(pattern: &str) -> Option<Vec<String>> {
-    // One range group: (start index, end index, values).
-    fn group(s: &str, open: usize) -> Option<(usize, Vec<String>)> {
-        let close_ch = if s[open..].starts_with('[') { ']' } else { ')' };
-        let rel = s[open + 1..].find(close_ch)?;
-        let inner = &s[open + 1..open + 1 + rel];
-        let (a, b) = inner.split_once('-')?;
-        let (a, b) = (a.trim(), b.trim());
-        let vals: Vec<String> = if !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit()) && !b.is_empty() {
-            let (x, y): (u64, u64) = (a.parse().ok()?, b.parse().ok()?);
-            if y < x || y - x > 10_000 {
-                return None;
-            }
-            let width = if a.len() > 1 && a.starts_with('0') { a.len() } else { 0 };
-            (x..=y).map(|n| format!("{n:0width$}")).collect()
-        } else if a.len() == 1 && b.len() == 1 {
-            let (x, y) = (a.chars().next()?, b.chars().next()?);
-            if !(x.is_ascii_alphabetic() && y.is_ascii_alphabetic()) || y < x {
-                return None;
-            }
-            (x..=y).map(|c| c.to_string()).collect()
-        } else {
-            return None;
-        };
-        Some((open + 1 + rel + 1, vals))
-    }
-    let mut parts: Vec<Vec<String>> = Vec::new();
-    let mut lit = String::new();
-    let mut i = 0;
-    let mut groups = 0;
-    while i < pattern.len() {
-        let c = pattern[i..].chars().next()?;
-        if c == '[' || c == '(' {
-            if let Some((next, vals)) = group(pattern, i) {
-                parts.push(vec![std::mem::take(&mut lit)]);
-                parts.push(vals);
-                groups += 1;
-                i = next;
-                continue;
-            }
-        }
-        lit.push(c);
-        i += c.len_utf8();
-    }
-    parts.push(vec![lit]);
-    if groups == 0 {
-        return None;
-    }
-    let total: usize = parts.iter().map(|p| p.len()).try_fold(1usize, |acc, n| acc.checked_mul(n))?;
-    if total > 10_000 {
-        return None;
-    }
-    let mut out = vec![String::new()];
-    for p in parts {
-        out = out.iter().flat_map(|pre| p.iter().map(move |v| format!("{pre}{v}"))).collect();
-    }
-    Some(out.into_iter().filter(|u| is_download_url(u)).collect())
 }
 
 // ---- URL lists, including IDM's export (.ef2) ------------------------------
@@ -2278,20 +2042,6 @@ pub fn record_finished_bytes(bytes: u64) {
 #[cfg(test)]
 mod batch_import_tests {
     use super::*;
-
-    #[test]
-    fn batch_patterns_expand() {
-        let v = expand_batch("https://s.example/img[008-011].jpg").unwrap();
-        assert_eq!(v, ["https://s.example/img008.jpg", "https://s.example/img009.jpg", "https://s.example/img010.jpg", "https://s.example/img011.jpg"]);
-        let v = expand_batch("https://s.example/(a-c)/p(1-2).zip").unwrap();
-        assert_eq!(v.len(), 6);
-        assert_eq!(v[0], "https://s.example/a/p1.zip");
-        assert_eq!(v[5], "https://s.example/c/p2.zip");
-        assert!(expand_batch("https://s.example/plain.zip").is_none());
-        assert!(expand_batch("https://s.example/x[1-99999].zip").is_none());
-        // Parentheses that are not a range stay as they are.
-        assert!(expand_batch("https://s.example/Movie (2024).mp4").is_none());
-    }
 
     #[test]
     fn idm_export_and_plain_lists_import() {

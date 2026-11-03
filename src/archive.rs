@@ -13,6 +13,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Refuse to write more than this in total (a real archive this big is rare;
 /// a bomb is not).
@@ -90,6 +91,7 @@ pub fn volume_of(name: &str) -> Option<Volume> {
 }
 
 /// Does file `name` belong to the multi-part set `set` (see [`Volume::set`])?
+#[cfg(test)]
 pub fn in_set(name: &str, set: &str) -> bool {
     volume_of(name).and_then(|v| v.set).is_some_and(|s| s == set)
 }
@@ -150,6 +152,89 @@ pub fn safe_join(root: &Path, name: &str) -> Option<PathBuf> {
     (parts > 0).then_some(out)
 }
 
+/// Symbolic links and Windows reparse points: a path that goes through one
+/// may leave the extraction folder even when its name looks safe.
+fn is_link_like(m: &std::fs::Metadata) -> bool {
+    if m.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if m.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Create `dir` one component at a time under `root`, refusing to pass
+/// through a link and refusing anything that is not a folder.
+fn create_dirs_under(root: &Path, dir: &Path) -> Result<(), Error> {
+    let rel = dir
+        .strip_prefix(root)
+        .map_err(|_| Error::Io("an archive path leaves the destination folder".into()))?;
+    let mut cur = root.to_path_buf();
+    for part in rel.components() {
+        let Component::Normal(name) = part else {
+            return Err(Error::Io("an archive path is not a plain relative path".into()));
+        };
+        cur.push(name);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if is_link_like(&m) => {
+                return Err(Error::Io(format!("refusing to write through the link {}", cur.display())));
+            }
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(Error::Io(format!("{} is not a folder", cur.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::create_dir(&cur) {
+                Ok(()) => {}
+                // Lost a race creating the same folder: re-check it.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let m = std::fs::symlink_metadata(&cur)?;
+                    if is_link_like(&m) || !m.is_dir() {
+                        return Err(Error::Io(format!("refusing to write through {}", cur.display())));
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            },
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// The parent of `path` must really be inside `root` after resolving links.
+fn parent_inside(root: &Path, path: &Path) -> bool {
+    path.parent()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .is_some_and(|p| p.starts_with(root))
+}
+
+/// A name next to `path` that does not exist yet.
+fn unique_sibling(path: &Path) -> Result<PathBuf, Error> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().replace(['/', '\\'], "_"))
+        .unwrap_or_else(|| "file".to_string());
+    for _ in 0..64 {
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let candidate = parent.join(format!(".{name}.dctmp-{}-{seq}-{nanos}", std::process::id()));
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::Io("could not create a temporary file next to the destination".into()))
+}
+
 #[derive(Debug)]
 pub enum Error {
     Password,
@@ -195,6 +280,8 @@ impl Outcome {
 
 struct Budget {
     out: Outcome,
+    /// Real (canonical) destination folder every write must stay inside.
+    root: PathBuf,
     entries: usize,
 }
 
@@ -208,35 +295,84 @@ impl Budget {
     }
 
     fn declared(&self, size: u64) -> Result<(), Error> {
-        if self.out.bytes.saturating_add(size) > MAX_TOTAL {
+        if self.out.bytes.checked_add(size).is_none_or(|v| v > MAX_TOTAL) {
             return Err(Error::Limit("it would unpack to more than 64 GB".into()));
         }
         Ok(())
+    }
+
+    /// Create a directory entry, refusing links and collisions.
+    fn dir(&mut self, name: &str) -> Result<(), Error> {
+        self.entry()?;
+        let Some(path) = safe_join(&self.root, name) else {
+            self.out.refused += 1;
+            return Ok(());
+        };
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if is_link_like(&m) => {
+                self.out.refused += 1;
+                return Ok(());
+            }
+            Ok(m) if m.is_dir() => return Ok(()),
+            // The name is taken by a file: keep it, like any existing file.
+            Ok(_) => {
+                self.out.skipped += 1;
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        create_dirs_under(&self.root, &path)
     }
 
     /// Where an entry goes, or `None` (counted) when it is refused or the
     /// file already exists.
     fn target(&mut self, name: &str) -> Result<Option<PathBuf>, Error> {
         self.entry()?;
-        let Some(path) = safe_join(&self.out.dest, name) else {
+        let Some(path) = safe_join(&self.root, name) else {
             self.out.refused += 1;
             return Ok(None);
         };
-        if path.exists() {
-            self.out.skipped += 1;
-            return Ok(None);
+        // `Path::exists` follows links: a dangling one would make a later
+        // create() write through it, outside the folder.
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if is_link_like(&m) => {
+                self.out.refused += 1;
+                return Ok(None);
+            }
+            Ok(_) => {
+                self.out.skipped += 1;
+                return Ok(None);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
-        if let Some(p) = path.parent() {
-            std::fs::create_dir_all(p)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Io("an archive entry has no parent folder".into()))?;
+        create_dirs_under(&self.root, parent)?;
+        if !parent_inside(&self.root, &path) {
+            self.out.refused += 1;
+            return Ok(None);
         }
         Ok(Some(path))
     }
 
-    /// Copy one entry's bytes, never past the total limit. A partly written
-    /// file is removed on failure.
-    fn write(&mut self, path: &Path, reader: &mut dyn Read) -> Result<(), Error> {
+    /// Copy one entry's bytes, never past the declared size or the total
+    /// limit. A partly written file is removed on failure, and a file that
+    /// appeared between `target` and here is kept (counted as skipped).
+    fn write(&mut self, path: &Path, reader: &mut dyn Read, expected: u64) -> Result<(), Error> {
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.out.skipped += 1;
+                // Solid archives need the entry's bytes consumed anyway.
+                std::io::copy(reader, &mut std::io::sink()).map_err(|e| Error::Broken(e.to_string()))?;
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
         let res = (|| -> Result<u64, Error> {
-            let mut file = std::fs::File::create(path)?;
             let mut buf = vec![0u8; 256 * 1024];
             let mut n = 0u64;
             loop {
@@ -244,11 +380,23 @@ impl Budget {
                 if k == 0 {
                     break;
                 }
-                n += k as u64;
-                if self.out.bytes + n > MAX_TOTAL {
+                n = n
+                    .checked_add(k as u64)
+                    .ok_or_else(|| Error::Limit("an archive entry is too large".into()))?;
+                if n > expected {
+                    return Err(Error::Broken(format!(
+                        "an entry unpacks to more than the {expected} bytes its header declares"
+                    )));
+                }
+                if self.out.bytes.checked_add(n).is_none_or(|v| v > MAX_TOTAL) {
                     return Err(Error::Limit("it would unpack to more than 64 GB".into()));
                 }
                 file.write_all(&buf[..k])?;
+            }
+            if n != expected {
+                return Err(Error::Broken(format!(
+                    "an entry unpacked to {n} bytes, but its header says {expected}"
+                )));
             }
             Ok(n)
         })();
@@ -275,7 +423,10 @@ pub fn extract(archive: &Path, dest: &Path) -> Result<Outcome, Error> {
         return Err(Error::Io(format!("{} is missing", vol.first)));
     }
     std::fs::create_dir_all(dest)?;
-    let mut b = Budget { out: Outcome { dest: dest.to_path_buf(), ..Outcome::default() }, entries: 0 };
+    // Resolve the destination once: every later containment check compares
+    // against the real folder, not a path that may itself contain a link.
+    let root = std::fs::canonicalize(dest)?;
+    let mut b = Budget { out: Outcome { dest: dest.to_path_buf(), ..Outcome::default() }, root, entries: 0 };
     match vol.kind {
         Kind::Zip => zip_extract(&start, &mut b)?,
         Kind::SevenZ => sevenz_extract(&start, &mut b)?,
@@ -300,17 +451,20 @@ fn zip_extract(path: &Path, b: &mut Budget) -> Result<(), Error> {
         }
         let name = entry.name().to_string();
         if entry.is_dir() {
+            b.dir(&name)?;
+            continue;
+        }
+        // A symlink entry must never be materialized: a later entry could
+        // then be written through it.
+        if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
             b.entry()?;
-            if let Some(dir) = safe_join(&b.out.dest, &name) {
-                std::fs::create_dir_all(dir)?;
-            } else {
-                b.out.refused += 1;
-            }
+            b.out.refused += 1;
             continue;
         }
         b.declared(entry.size())?;
+        let size = entry.size();
         if let Some(target) = b.target(&name)? {
-            b.write(&target, &mut entry)?;
+            b.write(&target, &mut entry, size)?;
         }
     }
     Ok(())
@@ -332,15 +486,11 @@ fn sevenz_extract(path: &Path, b: &mut Budget) -> Result<(), Error> {
                 return Ok(());
             }
             if entry.is_directory {
-                b.entry()?;
-                match safe_join(&b.out.dest, &entry.name) {
-                    Some(dir) => std::fs::create_dir_all(dir)?,
-                    None => b.out.refused += 1,
-                }
+                b.dir(&entry.name)?;
                 return Ok(());
             }
             match b.target(&entry.name)? {
-                Some(target) => b.write(&target, data),
+                Some(target) => b.write(&target, data, entry.size),
                 // Skipped entries still have to be read through: in a solid
                 // archive the next file's bytes come after them.
                 None => std::io::copy(data, &mut std::io::sink()).map(|_| ()).map_err(|e| Error::Broken(e.to_string())),
@@ -373,32 +523,80 @@ fn rar_extract(path: &Path, b: &mut Budget) -> Result<(), Error> {
         return Err(Error::Password);
     }
     while let Some(header) = arc.read_header().map_err(broken)? {
-        let entry = header.entry();
-        if entry.is_encrypted() {
+        let (is_encrypted, name, is_link, is_directory, size, is_split) = {
+            let entry = header.entry();
+            (
+                entry.is_encrypted(),
+                entry.filename.to_string_lossy().into_owned(),
+                entry.file_attr & 0o170000 == 0o120000,
+                entry.is_directory(),
+                entry.unpacked_size,
+                entry.is_split(),
+            )
+        };
+        if is_encrypted {
             return Err(Error::Password);
         }
-        let name = entry.filename.to_string_lossy().into_owned();
-        arc = if entry.is_directory() {
-            b.entry()?;
-            match safe_join(&b.out.dest, &name) {
-                Some(dir) => std::fs::create_dir_all(dir)?,
-                None => b.out.refused += 1,
-            }
+        // Unix RAR stores the mode in the attribute field; a symlink entry
+        // is refused instead of being materialized.
+        arc = if is_directory {
+            b.dir(&name)?;
             header.skip().map_err(broken)?
         } else {
-            let size = entry.unpacked_size;
-            b.declared(size)?;
-            match b.target(&name)? {
-                Some(target) => {
-                    let next = header.extract_to(&target).map_err(|e| {
-                        let _ = std::fs::remove_file(&target);
-                        broken(e)
-                    })?;
-                    b.out.bytes += std::fs::metadata(&target).map(|m| m.len()).unwrap_or(size);
-                    b.out.files += 1;
-                    next
+            if is_link {
+                b.entry()?;
+                b.out.refused += 1;
+                header.skip().map_err(broken)?
+            } else {
+                b.declared(size)?;
+                match b.target(&name)? {
+                    Some(target) => {
+                        // `unrar` only writes to a path, so unpack to a
+                        // unique sibling first and verify what actually
+                        // arrived before it replaces the destination.
+                        let tmp = unique_sibling(&target)?;
+                        let next = match header.extract_to(&tmp) {
+                            Ok(next) => next,
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&tmp);
+                                return Err(broken(e));
+                            }
+                        };
+                        let md = match std::fs::symlink_metadata(&tmp) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&tmp);
+                                return Err(e.into());
+                            }
+                        };
+                        if is_link_like(&md) || !md.is_file() {
+                            let _ = std::fs::remove_file(&tmp);
+                            return Err(Error::Broken(format!("{name} did not unpack to a regular file")));
+                        }
+                        let actual = md.len();
+                        // For a split entry `unpacked_size` describes this
+                        // part, not the joined file; the total below still
+                        // bounds what can reach the disk.
+                        if !is_split && actual != size {
+                            let _ = std::fs::remove_file(&tmp);
+                            return Err(Error::Broken(format!(
+                                "{name} unpacked to {actual} bytes, but its header says {size}"
+                            )));
+                        }
+                        if b.out.bytes.checked_add(actual).is_none_or(|v| v > MAX_TOTAL) {
+                            let _ = std::fs::remove_file(&tmp);
+                            return Err(Error::Limit("it would unpack to more than 64 GB".into()));
+                        }
+                        if let Err(e) = std::fs::rename(&tmp, &target) {
+                            let _ = std::fs::remove_file(&tmp);
+                            return Err(e.into());
+                        }
+                        b.out.bytes += actual;
+                        b.out.files += 1;
+                        next
+                    }
+                    None => header.skip().map_err(broken)?,
                 }
-                None => header.skip().map_err(broken)?,
             }
         };
     }
@@ -472,6 +670,39 @@ mod tests {
         assert_eq!(std::fs::read(dest.join("readme.txt")).unwrap(), b"mine");
         // The folder name is taken now: the next one gets a number.
         assert_eq!(destination(&z, true), d.join("Pack (2)"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_or_folder_is_never_written_through() {
+        use std::os::unix::fs::symlink;
+        let d = tmp("symlink");
+        let outside = d.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"keep me").unwrap();
+
+        // A file entry that lands on a symlink is refused and the target is
+        // left untouched.
+        let z = d.join("file.zip");
+        make_zip(&z, &[("link.txt", b"replaced")]);
+        let dest = d.join("file-out");
+        std::fs::create_dir_all(&dest).unwrap();
+        symlink(outside.join("keep.txt"), dest.join("link.txt")).unwrap();
+        let out = extract(&z, &dest).unwrap();
+        assert_eq!(out.files, 0);
+        assert_eq!(out.refused, 1);
+        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"keep me");
+
+        // A directory entry that goes through a symlinked folder must not
+        // write outside: extraction stops instead.
+        let z2 = d.join("dir.zip");
+        make_zip(&z2, &[("sub/evil.txt", b"escaped")]);
+        let dest2 = d.join("dir-out");
+        std::fs::create_dir_all(&dest2).unwrap();
+        symlink(&outside, dest2.join("sub")).unwrap();
+        assert!(extract(&z2, &dest2).is_err());
+        assert!(!outside.join("evil.txt").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

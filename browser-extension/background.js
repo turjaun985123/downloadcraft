@@ -6,6 +6,7 @@ const HOST = "com.download_craft";
 const GRACE_MS = 15_000; // ignore our own fallback re-downloads
 const seen = new Map(); // url -> timestamp (loop guard)
 let hostOk = true;
+let appState = "not_running";
 let lastHostError = "";
 let lastFallbackError = "";
 // Must match manifest version + content.js EXT_VER. Tabs running an older
@@ -846,6 +847,8 @@ async function sendToHostPing() {
   try {
     const res = await hostSend({ type: "ping" });
     hostOk = !!res && res.type === "pong";
+    appState = hostOk && ["starting", "running", "closing", "not_running"].includes(res.app_state)
+      ? res.app_state : (hostOk ? "not_running" : "host_unavailable");
     // The app's Light/Dark/System choice, for the in-page bar and panels.
     if (res && /^(light|dark|system)$/.test(res.theme || "")) {
       const cur = await api.storage.local.get({ appTheme: "system" });
@@ -858,6 +861,7 @@ async function sendToHostPing() {
     );
   } catch (e) {
     hostOk = false;
+    appState = "host_unavailable";
     lastHostError = (e && e.message) || String(e);
     console.error(
       "[download-craft] native host '" + HOST + "' unreachable:", lastHostError
@@ -1801,7 +1805,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await sendToHostPing();
       const cfg = await settings();
       const downloadUI = await syncBrowserDownloadUI();
-      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, detection: detectionOn, deepDetect: cfg.deepDetect !== false, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, hostError: lastHostError || null, fallbackError: lastFallbackError || null,
+      return { hideBrowserUI:!!cfg.hideBrowserUI, downloadUI, autoCapture: !!cfg.autoCapture, detection: detectionOn, deepDetect: cfg.deepDetect !== false, minSizeKB: cfg.minSizeKB, blockHosts: cfg.blockHosts, hostOk, appState, hostError: lastHostError || null, fallbackError: lastFallbackError || null,
         live: typeof DCBridge !== "undefined" && DCBridge.live(), captureTypes: cfg.captureTypes || "" };
     }
     if (msg.type === "setAuto" && typeof msg.value === "boolean") {

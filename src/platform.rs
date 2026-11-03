@@ -1,8 +1,23 @@
 //! OS-specific integration. Windows keeps its existing implementation;
 //! these functions provide the native equivalents on macOS and Linux.
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Construct a child process without opening a console window on Windows.
+/// Use this for helpers and OS integration commands launched by the GUI.
+pub fn silent_command(program: impl AsRef<OsStr>) -> Command {
+    #[cfg(windows)]
+    let mut command = Command::new(program);
+    #[cfg(not(windows))]
+    let command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command
+}
 /// AppImage mount paths disappear after exit. Relaunch the permanent image.
 pub fn launch_path() -> std::io::Result<PathBuf> {
     #[cfg(target_os = "linux")]
@@ -94,17 +109,17 @@ pub fn open_url(url: &str) {
         return;
     }
     #[cfg(windows)]
-    let _ = Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]).spawn();
+    let _ = silent_command("rundll32.exe").args(["url.dll,FileProtocolHandler", url]).spawn();
     #[cfg(target_os = "macos")]
-    let _ = Command::new("open").arg(url).spawn();
+    let _ = silent_command("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
-    let _ = Command::new("xdg-open").arg(url).spawn();
+    let _ = silent_command("xdg-open").arg(url).spawn();
 }
 
 pub fn open(path: &Path, reveal: bool) {
     #[cfg(target_os = "macos")]
     {
-        let mut c = Command::new("open");
+        let mut c = silent_command("open");
         if reveal && !path.is_dir() {
             c.arg("-R");
         }
@@ -118,116 +133,11 @@ pub fn open(path: &Path, reveal: bool) {
         } else {
             path
         };
-        let _ = Command::new("xdg-open").arg(target).spawn();
+        let _ = silent_command("xdg-open").arg(target).spawn();
     }
     #[cfg(windows)]
     {
         let _ = (path, reveal);
-    }
-}
-/// A short system sound: "done" or "failed" (best effort, never blocks).
-pub fn play_sound(ok: bool) {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONASTERISK, MB_ICONHAND};
-        unsafe {
-            MessageBeep(if ok { MB_ICONASTERISK } else { MB_ICONHAND });
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let f = if ok { "/System/Library/Sounds/Glass.aiff" } else { "/System/Library/Sounds/Basso.aiff" };
-        let _ = std::process::Command::new("afplay").arg(f).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let id = if ok { "complete" } else { "dialog-error" };
-        let _ = std::process::Command::new("canberra-gtk-play").args(["-i", id]).spawn();
-    }
-}
-
-/// One of the Sounds page's events ("complete", "failed", "queue_start",
-/// "queue_done"), when it is switched on there.
-pub fn play_event(event: &str) {
-    let legacy = crate::model::ui_pref_bool("sounds", false) && (event == "complete" || event == "failed");
-    if !crate::model::ui_pref_bool(&format!("sound_{event}"), legacy) {
-        return;
-    }
-    play_sound_file(event, &crate::model::ui_pref_str(&format!("sound_{event}_file"), ""));
-}
-
-/// Play `file` (a .wav), or the system sound for `event` when it is empty
-/// or missing.
-pub fn play_sound_file(event: &str, file: &str) {
-    let file = file.trim();
-    if file.is_empty() || !Path::new(file).is_file() {
-        play_sound(event != "failed");
-        return;
-    }
-    #[cfg(windows)]
-    {
-        #[link(name = "winmm")]
-        extern "system" {
-            fn PlaySoundW(sound: *const u16, module: isize, flags: u32) -> i32;
-        }
-        const SND_ASYNC: u32 = 0x0001;
-        const SND_NODEFAULT: u32 = 0x0002;
-        const SND_FILENAME: u32 = 0x0002_0000;
-        let wide: Vec<u16> = file.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: `wide` is NUL-terminated; SND_ASYNC copies what it needs.
-        unsafe { PlaySoundW(wide.as_ptr(), 0, SND_FILENAME | SND_ASYNC | SND_NODEFAULT) };
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = Command::new("afplay").arg(file).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if Command::new("paplay").arg(file).spawn().is_err() {
-            let _ = Command::new("aplay").arg("-q").arg(file).spawn();
-        }
-    }
-}
-
-pub fn power(action: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut c = Command::new(if action == "sleep" {
-            "pmset"
-        } else {
-            "osascript"
-        });
-        if action == "sleep" {
-            c.arg("sleepnow");
-        } else if action == "shutdown" {
-            c.args(["-e", "tell application \"System Events\" to shut down"]);
-        } else {
-            return Err("Hibernation is not offered by this macOS build".into());
-        }
-        c
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut c = Command::new("systemctl");
-        c.arg(match action {
-            "shutdown" => "poweroff",
-            "sleep" => "suspend",
-            "hibernate" => "hibernate",
-            _ => return Err("Unknown power action".into()),
-        });
-        c
-    };
-    #[cfg(windows)]
-    return Err("Windows uses the existing power integration".into());
-    #[cfg(unix)]
-    {
-        let out = command.output().map_err(|e| e.to_string())?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).into_owned())
-        }
     }
 }
 /// Browsers whose native-host registration the app keeps current. Linux
@@ -319,7 +229,7 @@ pub fn install_native_host(browser: &str) -> Result<String, String> {
         manifest["allowed_extensions"] = serde_json::json!(["send-to-download-craft@example"]);
     } else {
         manifest["allowed_origins"] =
-            serde_json::json!([format!("chrome-extension://{}/", crate::app::EXTENSION_ID)]);
+            serde_json::json!([format!("chrome-extension://{}/", crate::integration::EXTENSION_ID)]);
     }
     let path = dir.join("com.download_craft.json");
     std::fs::write(
@@ -437,63 +347,11 @@ mod audit_tests {
     use super::*;
     #[test]
     fn audit_version_probe_drains_large_output() {
-        let mut c = Command::new("python3");
+        let mut c = silent_command("python3");
         c.args(["-c", "import sys;sys.stdout.write('v' * 262144)"]);
         let out = version_output(c).expect("a noisy working tool must not deadlock");
         assert!(out.status.success());
         assert!(!out.stdout.is_empty());
-    }
-}
-
-/// Parse an executable and arguments before substituting an untrusted filename.
-/// Downloaded names must never become shell commands.
-pub fn antivirus_command(template: &str, path: &Path) -> Result<Command,String> {
-    #[cfg(unix)]
-    let args=shlex::split(template).ok_or("Antivirus command has unmatched quotes")?;
-    #[cfg(windows)]
-    let args=windows_command_args(template)?;
-    let (program,args)=args.split_first().ok_or("Antivirus command is empty")?;
-    if program.is_empty() {return Err("Antivirus executable is empty".into());}
-    let mut cmd=Command::new(program);
-    for arg in args { cmd.arg(arg.replace("{file}",&path.to_string_lossy())); }
-    #[cfg(windows)]
-    {use std::os::windows::process::CommandExt;cmd.creation_flags(0x08000000);}
-    cmd.stdin(std::process::Stdio::null());
-    Ok(cmd)
-}
-#[cfg(windows)]
-fn windows_command_args(template:&str) -> Result<Vec<String>,String> {
-    #[link(name="shell32")]
-    unsafe extern "system" {fn CommandLineToArgvW(command:*const u16,count:*mut i32)->*mut *mut u16;}
-    #[link(name="kernel32")]
-    unsafe extern "system" {fn LocalFree(memory:*mut std::ffi::c_void)->*mut std::ffi::c_void;}
-    if template.trim().is_empty() {return Ok(Vec::new());}
-    if template.contains('\0') {return Err("Antivirus command contains a null character".into());}
-    let text:Vec<u16>=template.encode_utf16().chain(Some(0)).collect();
-    let mut count=0;
-    unsafe {
-        let ptr=CommandLineToArgvW(text.as_ptr(),&mut count);
-        if ptr.is_null() {return Err("Could not parse antivirus command".into());}
-        let result=std::slice::from_raw_parts(ptr,count as usize).iter().map(|arg|{
-            let mut len=0;while *arg.add(len)!=0 {len+=1;}
-            String::from_utf16_lossy(std::slice::from_raw_parts(*arg,len))
-        }).collect();
-        LocalFree(ptr.cast());
-        Ok(result)
-    }
-}
-#[cfg(all(test,unix))]
-mod audit_antivirus_tests {
-    use super::*;
-    #[test]
-    fn downloaded_filename_is_passed_as_one_literal_argument() {
-        let path=Path::new("/tmp/a name;$(printf HACKED)&'file'");
-        for template in ["printf '%s' {file}","printf '%s' \"{file}\""] {
-            let out=antivirus_command(template,path).unwrap().output().unwrap();
-            assert!(out.status.success());
-            assert_eq!(out.stdout,path.as_os_str().as_encoded_bytes());
-        }
-        assert!(antivirus_command("'unterminated",path).is_err());
     }
 }
 
@@ -540,96 +398,4 @@ impl Drop for HelperProcessTree {
         #[cfg(windows)]
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job as *mut std::ffi::c_void); }
     }
-}
-
-/// Drag files out of the app, as Explorer does: dropped on Explorer, the
-/// desktop, a chat or a mail, they are copied there. Blocks until the drop
-/// (the system runs the drag), so call it while the mouse button is held.
-#[cfg(windows)]
-pub fn drag_files_out(files: &[PathBuf]) {
-    use windows_sys::Win32::System::Ole::{OleInitialize, DROPEFFECT_COPY, DROPEFFECT_LINK};
-    use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows_sys::Win32::UI::Shell::{ILFree, SHCreateDataObject, SHDoDragDrop, SHParseDisplayName};
-    // IID_IDataObject {0000010e-0000-0000-C000-000000000046}
-    const IID_IDATAOBJECT: windows_sys::core::GUID = windows_sys::core::GUID {
-        data1: 0x0000_010e,
-        data2: 0,
-        data3: 0,
-        data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
-    };
-    let hwnd = crate::tray::hwnd();
-    if files.is_empty() || hwnd == 0 {
-        return;
-    }
-    unsafe {
-        // Already set up by the window on this thread; harmless if so.
-        use std::os::windows::ffi::OsStrExt;
-        let _ = OleInitialize(std::ptr::null());
-        let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
-        for f in files {
-            let wide: Vec<u16> = f.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
-            if SHParseDisplayName(wide.as_ptr(), std::ptr::null_mut(), &mut pidl, 0, std::ptr::null_mut()) == 0 && !pidl.is_null() {
-                pidls.push(pidl);
-            }
-        }
-        if !pidls.is_empty() {
-            let list: Vec<*const ITEMIDLIST> = pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
-            let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
-            // Absolute item lists with no parent folder: the desktop's.
-            if SHCreateDataObject(std::ptr::null(), list.len() as u32, list.as_ptr(), std::ptr::null_mut(), &IID_IDATAOBJECT, &mut data) == 0
-                && !data.is_null()
-            {
-                let mut effect = 0u32;
-                // No drop source of our own: the shell supplies the standard one.
-                let _ = SHDoDragDrop(hwnd as _, data, std::ptr::null_mut(), DROPEFFECT_COPY | DROPEFFECT_LINK, &mut effect);
-                // IUnknown::Release is the third entry of the object's table.
-                let vtbl = *(data as *const *const usize);
-                let release: extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
-                release(data);
-            }
-        }
-        for p in pidls {
-            ILFree(p);
-        }
-    }
-}
-
-#[cfg(not(windows))]
-pub fn drag_files_out(_files: &[PathBuf]) {}
-
-/// Whether windows should keep the OS title bar instead of painting their
-/// own. The borderless window relies on DWM drawing the client area over the
-/// whole frame; stripped Windows builds (Themes service off, "Micro 10" and
-/// similar) still reserve the caption, so the picture lands one caption lower
-/// than where clicks are read and every button answers above itself. The
-/// `system_title_bar` key in ui.json wins; without it this follows the theme
-/// state.
-pub fn system_title_bar() -> bool {
-    if std::env::var_os("DOWNLOADCRAFT_SYSTEM_FRAME").is_some_and(|v| v != "0") {
-        return true;
-    }
-    crate::model::ui_pref_bool("system_title_bar", frame_unsupported())
-}
-
-/// The OS cannot host a borderless window cleanly: visual styles or desktop
-/// composition are off.
-#[cfg(windows)]
-pub fn frame_unsupported() -> bool {
-    #[link(name = "uxtheme")]
-    extern "system" {
-        fn IsThemeActive() -> i32;
-    }
-    #[link(name = "dwmapi")]
-    extern "system" {
-        fn DwmIsCompositionEnabled(enabled: *mut i32) -> i32;
-    }
-    let mut on = 0i32;
-    // SAFETY: plain queries; `on` outlives the call.
-    unsafe { IsThemeActive() == 0 || DwmIsCompositionEnabled(&mut on) != 0 || on == 0 }
-}
-
-#[cfg(not(windows))]
-pub fn frame_unsupported() -> bool {
-    false
 }

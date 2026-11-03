@@ -60,7 +60,7 @@ fn check_tool(path: &Path, name: &str) -> bool {
     if !crate::platform::executable_file(path) {
         return false;
     }
-    let mut c = std::process::Command::new(path);
+    let mut c = crate::platform::silent_command(path);
     c.arg("-version");
     crate::platform::first_run_output(c)
         .map(|o| {

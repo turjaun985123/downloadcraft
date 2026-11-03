@@ -1,31 +1,33 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// The binary test harness replaces `main`, so app-only helpers look unused
+// even though the production entry point calls them. Production builds keep
+// the normal dead-code lint enabled.
+#![cfg_attr(test, allow(dead_code))]
 //! Download Craft: GUI + CLI + native host + standalone dialogs.
 //! Release builds run without a console window; all diagnostics go to
 //! %APPDATA%/download_craft/crash.log and the in-app log/queues panels.
 
 mod aes128;
 mod archive;
-mod app;
-mod basket;
+mod about_service;
+mod basket_service;
+mod capture_service;
+mod integration;
+#[cfg(feature = "gpui-ui")]
+mod gpui_app;
 mod cli;
-mod complete;
-mod confirm;
-mod dm;
+mod complete_service;
+mod confirm_core;
+#[cfg(feature = "gpui-ui")]
+mod gpui_confirm;
 mod engine;
-mod fonts;
 mod ftp;
 mod gdrive;
 mod grabber;
 mod i18n;
-mod links;
-mod manual;
+mod links_service;
 mod model;
 mod native_host;
-mod progress;
-mod settings;
-mod setup;
-mod about;
-mod shaped;
 mod selfupdate;
 mod autostart;
 mod sysproxy;
@@ -36,9 +38,11 @@ mod tray;
 #[path="tray_portable.rs"]
 mod tray;
 mod platform;
+mod progress_service;
+mod setup_service;
+mod update_service;
 mod helpers;
 
-use app::CraftApp;
 use clap::Parser;
 use std::sync::Arc;
 
@@ -58,52 +62,98 @@ fn install_panic_hook() {
     }));
 }
 
-fn main() -> eframe::Result<()> {
+#[cfg(not(feature = "gpui-ui"))]
+fn ui_unavailable() -> ! {
+    eprintln!("Download Craft's desktop interface was disabled in this build.");
+    std::process::exit(2);
+}
+
+fn main() {
+    // Native messaging is a short-lived stdio service. Detect it before GUI
+    // setup or instance locks so a running desktop process cannot intercept it.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--native-host") || native_host::launched_directly(&args) {
+        model::migrate_config();
+        if let Err(error) = model::secure_config_directory() {
+            eprintln!("Could not protect application state directory: {error}");
+        }
+        native_host::run();
+        return;
+    }
+
     // Migrate legacy `idm_rust` config (queue/settings/inbox) forward.
     model::migrate_config();
     if let Err(e)=model::secure_config_directory() { eprintln!("Could not protect application state directory: {e}"); }
     install_panic_hook();
-    // Native-messaging host mode for the browser extension:
-    // launched by Chrome/Edge/Firefox, speaks length-prefixed JSON on stdio.
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--native-host") || native_host::launched_directly(&args) {
-        return native_host::run();
-    }
     // IDM-style standalone "Download File Info" dialog (one OS window per
     // captured download, always on top). Spawned by the native host.
     if args.iter().any(|a| a == "--confirm-download") {
-        return confirm::run();
+        #[cfg(feature = "gpui-ui")]
+        { gpui_confirm::run_gpui(); return; }
+        #[cfg(not(feature = "gpui-ui"))]
+        { ui_unavailable(); }
     }
     // IDM-style "Download all links" picker (spawned by the native host).
     if args.iter().any(|a| a == "--links") {
-        return links::run();
+        #[cfg(feature = "gpui-ui")]
+        {
+            let path = args.iter().position(|arg| arg == "--links")
+                .and_then(|index| args.get(index + 1))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            gpui_app::run_links(path);
+            return;
+        }
+        #[cfg(not(feature = "gpui-ui"))]
+        { ui_unavailable(); }
     }
     // IDM-style standalone per-download progress window.
     if args.iter().any(|a| a == "--progress") {
-        return progress::run();
+        #[cfg(feature = "gpui-ui")]
+        { gpui_app::run_progress(); return; }
+        #[cfg(not(feature = "gpui-ui"))]
+        { ui_unavailable(); }
     }
     // IDM-style standalone "Download complete" dialog (popped by the app when
     // a download finishes).
     if args.iter().any(|a| a == "--complete") {
-        return complete::run();
+        #[cfg(feature = "gpui-ui")]
+        { gpui_app::run_complete(); return; }
+        #[cfg(not(feature = "gpui-ui"))]
+        { ui_unavailable(); }
     }
     // P3.3 companions: drop basket + mini status.
     if args.iter().any(|a| a == "--basket") {
-        return basket::run_basket();
+        #[cfg(feature = "gpui-ui")]
+        { gpui_app::run_basket(); return; }
+        #[cfg(not(feature = "gpui-ui"))]
+        { ui_unavailable(); }
     }
     // Standalone Settings window (two-pane, separate OS window).
     if args.iter().any(|a| a == "--settings") {
-        return settings::run();
+        #[cfg(feature = "gpui-ui")]
+        { gpui_app::run_settings(); return; }
+        #[cfg(not(feature = "gpui-ui"))]
+        { ui_unavailable(); }
     }
     // "Get ready": what the app needs, with one-click fixes.
     if args.iter().any(|a| a == "--about") {
-        return about::run();
+        #[cfg(feature = "gpui-ui")]
+        { gpui_app::run_about(); return; }
+        #[cfg(not(feature = "gpui-ui"))]
+        { ui_unavailable(); }
     }
     if args.iter().any(|a| a == "--setup") {
-        return setup::run();
+        #[cfg(feature = "gpui-ui")]
+        { gpui_app::run_setup(); return; }
+        #[cfg(not(feature = "gpui-ui"))]
+        { ui_unavailable(); }
     }
     if args.iter().any(|a| a == "--mini") {
-        return basket::run_mini();
+        #[cfg(feature = "gpui-ui")]
+        { gpui_app::run_mini(); return; }
+        #[cfg(not(feature = "gpui-ui"))]
+        { ui_unavailable(); }
     }
     // Started by a one-click update: wait for the old version to close,
     // then start the window as usual.
@@ -121,7 +171,7 @@ fn main() -> eframe::Result<()> {
                     eprintln!("error: {e:#}");
                     std::process::exit(1);
                 }
-                return Ok(());
+                return;
             }
             Err(e) => {
                 // clap handles --help/--version (exit 0) vs real errors (exit 2).
@@ -135,8 +185,9 @@ fn main() -> eframe::Result<()> {
     // fresh window behind whatever the user is looking at.
     let _instance = match tray::claim_main_instance() {
         Some(slot) => slot,
-        None => return Ok(()),
+        None => return,
     };
+    crate::model::set_app_lifecycle("starting");
 
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
@@ -144,34 +195,16 @@ fn main() -> eframe::Result<()> {
             .build()
             .expect("tokio runtime"),
     );
-    // No OS caption: the app paints its own title bar (brand, menus, search,
-    // update chip, window buttons — `main_window_titlebar.html`). Drag, resize,
-    // snap and double-click still go through the OS (`StartDrag` / `BeginResize`).
-    // Systems that cannot host that keep the OS caption (`system_title_bar`).
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([920.0, 500.0])
-        .with_min_inner_size([840.0, 480.0])
-        .with_decorations(crate::platform::system_title_bar());
-    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
-        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    #[cfg(feature = "gpui-ui")]
+    {
+        std::thread::spawn(crate::native_host::refresh_site_rules);
+        crate::gpui_app::run(rt);
+        crate::model::clear_heartbeat();
+        return;
     }
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
-    // Site rules for the browser extension: newer ones from the project, at
-    // most once a day, off the UI thread.
-    std::thread::spawn(crate::native_host::refresh_site_rules);
-    let result = eframe::run_native(
-        crate::model::APP_NAME,
-        options,
-        Box::new(|cc| {
-            crate::app::setup_fonts(cc);
-            app::apply_theme(&cc.egui_ctx, &app::stored_theme());
-
-            Ok(Box::new(CraftApp::new(rt.clone())))
-        }),
-    );
-    crate::model::clear_heartbeat();
-    result
+    #[cfg(not(feature = "gpui-ui"))]
+    {
+        let _ = rt;
+        ui_unavailable();
+    }
 }

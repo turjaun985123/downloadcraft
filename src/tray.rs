@@ -1,8 +1,8 @@
 //! Tray behaviour: park the window off-screen instead of hiding it.
 //!
-//! eframe only runs a frame when the window repaints, and a *hidden* window
+//! The UI loop only runs a frame when the window repaints, and a *hidden* window
 //! never receives `WM_PAINT` (winit's own comment: "the window technically has
-//! to be visible to receive WM_PAINT messages"). `ViewportCommand::Visible(false)`
+//! to be visible to receive WM_PAINT messages"). Hiding the native window
 //! therefore froze the entire app while it sat in the tray: transfer progress
 //! and completions were never reported, the browser inbox was never drained
 //! (so captures looked stuck), the liveness heartbeat went stale and the tray
@@ -18,7 +18,7 @@ use std::sync::Mutex;
 
 /// True while the window is parked off-screen ("in the tray").
 static PARKED: AtomicBool = AtomicBool::new(false);
-/// Native window handle of the main window (set from the eframe frame).
+/// Native window handle of the main window (set from the GPUI window).
 static HWND: AtomicIsize = AtomicIsize::new(0);
 /// Set by the tray's Exit item, consumed by the frame loop.
 static QUIT: AtomicBool = AtomicBool::new(false);
@@ -38,6 +38,9 @@ static TITLEBAR_RGB: AtomicI32 = AtomicI32::new(-1);
 /// thread* to raise the window: only the thread that owns the window can win
 /// the foreground lock reliably, so the request is parked here until `update`.
 static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Set only when the GPUI-owned tray icon was created successfully. If icon
+/// setup fails, let the normal close button quit instead of hiding the app.
+static GPUI_TRAY_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 const TRAY_TIP: &str = "Download Craft";
 /// Auto-reset event used to wake the running manager when the user launches
@@ -184,10 +187,10 @@ pub fn take_quit() -> bool {
 
 /// Count one frame and keep the paint pump armed.
 ///
-/// eframe only runs `update` when the window paints, and Windows stops
+/// GPUI runs UI work when the window paints, and Windows stops
 /// generating `WM_PAINT` on its own for a window the compositor has nothing to
 /// draw for: parked far off-screen (and, less often, fully covered by other
-/// windows). eframe's own redraw requests go through an internal-paint flag
+/// windows). Ordinary redraw requests go through an internal-paint flag
 /// that such a window never turns into a paint. The app then looks alive - the
 /// window is visible, the tray icon answers right-clicks, the menu opens - while
 /// every frame-driven job is dead: progress reporting, the browser inbox, the
@@ -292,6 +295,17 @@ pub fn park() {
                 | win32::SWP_NOACTIVATE
                 | win32::SWP_SHOWWINDOW,
         );
+    }
+}
+
+/// GPUI close-request hook: keep the process and queue alive in the tray on
+/// Windows, unless the user explicitly selected Exit.
+pub fn close_main_window() -> bool {
+    if quitting() || !GPUI_TRAY_INSTALLED.load(Ordering::SeqCst) {
+        true
+    } else {
+        park();
+        false
     }
 }
 
@@ -419,6 +433,64 @@ pub fn install_menu_handler() {
             request_quit();
         }
     }));
+}
+
+/// Build the tray icon for the GPUI application. The icon is returned so the
+/// caller can keep it alive for the lifetime of the GPUI event loop.
+pub fn build_gpui_tray() -> Option<tray_icon::TrayIcon> {
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png"))
+        .ok()?
+        .to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let icon = tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()?;
+    let menu = tray_icon::menu::Menu::new();
+    let show = tray_icon::menu::MenuItem::with_id("tray-show", "Show Download Craft", true, None);
+    let exit = tray_icon::menu::MenuItem::with_id("tray-exit", "Exit", true, None);
+    menu.append_items(&[&show, &exit]).ok()?;
+
+    install_menu_handler();
+    let tray = tray_icon::TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .with_tooltip(tooltip())
+        .with_icon(icon)
+        .build()
+        .ok();
+    GPUI_TRAY_INSTALLED.store(tray.is_some(), Ordering::SeqCst);
+    if tray.is_some() {
+        start_tray_event_listener();
+        start_keepalive();
+    }
+    tray
+}
+
+/// GPUI does not poll tray events from a frame callback, so consume left-click
+/// events on a small listener thread and route them through the same show path
+/// as the menu item.
+fn start_tray_event_listener() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        while !quitting() {
+            while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+                match event {
+                    tray_icon::TrayIconEvent::Click {
+                        button: tray_icon::MouseButton::Left,
+                        button_state: tray_icon::MouseButtonState::Up,
+                        ..
+                    }
+                    | tray_icon::TrayIconEvent::DoubleClick {
+                        button: tray_icon::MouseButton::Left,
+                        ..
+                    } => show(),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
 }
 
 pub fn tooltip() -> &'static str {
@@ -824,5 +896,6 @@ mod win32 {
     pub const WAIT_OBJECT_0: u32 = 0;
 }
 
-/// Windows already uses the native HWND; portable builds retain the egui context.
-pub fn set_context(_: &egui::Context) {}
+/// Compatibility hook for legacy call sites. GPUI is driven by its own
+/// `WindowHandle` and does not install a renderer context here.
+pub fn set_context<T>(_: &T) {}

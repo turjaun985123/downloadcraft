@@ -15,8 +15,11 @@
 //! removed at the next start. Settings, the list and history live in the
 //! config folder, which an update never touches.
 
-use anyhow::{anyhow, Context, Result};
-use std::path::{Path, PathBuf};
+use anyhow::{anyhow, bail, Context, Result};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A release asset: where it is and what it must hash to.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -30,6 +33,18 @@ pub struct Asset {
 }
 
 const OLD_SUFFIX: &str = ".dcold";
+
+/// The updater refuses anything larger than this before writing a byte.
+const MAX_ARCHIVE_SIZE: u64 = 512 * 1024 * 1024;
+/// Unpacked output cap for one update (a release is a few hundred MB).
+const MAX_UNPACKED_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_ENTRY_SIZE: u64 = 1024 * 1024 * 1024;
+const MAX_ENTRIES: usize = 10_000;
+const MAX_INSTALL_FILES: usize = 20_000;
+
+fn valid_sha256(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
 /// The app's folder when it can update itself there: a portable copy in a
 /// folder this user can write to. A build run from a source checkout
@@ -50,58 +65,215 @@ fn writable(dir: &Path) -> bool {
     ok
 }
 
-/// Where downloads and unpacking happen.
-fn work_dir() -> PathBuf {
-    std::env::temp_dir().join("download-craft-update")
+/// A fresh, private work folder. The name carries the PID and a monotonic
+/// timestamp so a local user cannot pre-create it in the shared temp folder,
+/// and Unix gets mode 0700 before anything is written.
+fn work_dir() -> Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::temp_dir();
+    for _ in 0..64 {
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let dir = base.join(format!("download-craft-update-{}-{seq}-{nanos}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                }
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(anyhow!("could not create a private update folder"))
 }
 
 /// Download `asset` and check it. `progress` gets 0.0..=1.0.
+///
+/// Fails closed: a release without a SHA-256 and a size is never installed,
+/// and neither the declared size nor the 512 MiB archive cap can be crossed
+/// while streaming.
 pub async fn download(client: &reqwest::Client, asset: &Asset, mut progress: impl FnMut(f32)) -> Result<PathBuf> {
+    let want = asset
+        .sha256
+        .as_deref()
+        .filter(|s| valid_sha256(s))
+        .ok_or_else(|| anyhow!("the release does not publish a valid SHA-256 for this update; refusing to install it"))?
+        .to_ascii_lowercase();
+    if asset.size == 0 {
+        return Err(anyhow!("the release does not publish the update's size; refusing to install it"));
+    }
+    if asset.size > MAX_ARCHIVE_SIZE {
+        return Err(anyhow!("the update is {} bytes, larger than the {} MiB limit", asset.size, MAX_ARCHIVE_SIZE / (1024 * 1024)));
+    }
+    let dir = work_dir()?;
+    match download_into(&dir, client, asset, &want, &mut progress).await {
+        Ok(path) => Ok(path),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(e)
+        }
+    }
+}
+
+async fn download_into(
+    dir: &Path,
+    client: &reqwest::Client,
+    asset: &Asset,
+    want: &str,
+    progress: &mut impl FnMut(f32),
+) -> Result<PathBuf> {
     use futures_util::StreamExt;
     use sha2::{Digest, Sha256};
-    use std::io::Write;
-    let dir = work_dir();
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
     let name = if asset.name.is_empty() { "update.zip".to_string() } else { crate::engine::sanitize_filename(&asset.name) };
     let path = dir.join(name);
     let resp = client.get(&asset.url).send().await.context("downloading the update")?;
     if !resp.status().is_success() {
         return Err(anyhow!("the update download failed (HTTP {})", resp.status()));
     }
-    let total = resp.content_length().unwrap_or(asset.size).max(1);
-    let mut file = std::fs::File::create(&path)?;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_ARCHIVE_SIZE {
+            return Err(anyhow!("the update is {len} bytes, larger than the {} MiB limit", MAX_ARCHIVE_SIZE / (1024 * 1024)));
+        }
+        if len != asset.size {
+            return Err(anyhow!("the update is {len} bytes, the release says {}", asset.size));
+        }
+    }
+    let total = asset.size.max(1);
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     let mut hasher = Sha256::new();
     let mut got = 0u64;
     let mut body = resp.bytes_stream();
     while let Some(chunk) = body.next().await {
         let chunk = chunk.context("downloading the update")?;
+        got = got
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow!("the update is larger than the release says"))?;
+        if got > asset.size || got > MAX_ARCHIVE_SIZE {
+            return Err(anyhow!("the update is larger than the release says"));
+        }
         file.write_all(&chunk)?;
         hasher.update(&chunk);
-        got += chunk.len() as u64;
         progress((got as f32 / total as f32).min(1.0));
     }
     file.flush()?;
+    file.sync_all()?;
     drop(file);
-    if asset.size > 0 && got != asset.size {
+    if got != asset.size {
         return Err(anyhow!("the update is {got} bytes, the release says {}", asset.size));
     }
-    if let Some(want) = &asset.sha256 {
-        let have = format!("{:x}", hasher.finalize());
-        if !have.eq_ignore_ascii_case(want) {
-            return Err(anyhow!("the update's checksum does not match the release (got {have}, expected {want})"));
-        }
+    let have = format!("{:x}", hasher.finalize());
+    if !have.eq_ignore_ascii_case(want) {
+        return Err(anyhow!("the update's checksum does not match the release (got {have}, expected {want})"));
     }
     Ok(path)
+}
+
+/// Remove a path without ever following a symbolic link.
+fn remove_any(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Err(_) => {}
+    }
+}
+
+/// Refuse to touch a file that is not a plain regular file. Symlinks and
+/// reparse points are how an archive escapes its destination.
+fn is_plain_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.is_file() && !m.file_type().is_symlink() && !is_reparse_point(&m))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(m: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    m.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_m: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Create `dir` one component at a time under `root`, refusing to pass
+/// through a symlink or a reparse point.
+fn create_dirs_under(root: &Path, dir: &Path) -> Result<()> {
+    let rel = dir.strip_prefix(root).map_err(|_| anyhow!("an update path leaves its folder"))?;
+    let mut cur = root.to_path_buf();
+    for c in rel.components() {
+        let Component::Normal(name) = c else { return Err(anyhow!("an update path is not a plain relative path")) };
+        cur.push(name);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() || is_reparse_point(&m) => {
+                return Err(anyhow!("the update would write through the link {}", cur.display()));
+            }
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(anyhow!("{} is not a folder", cur.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cur)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+fn inside_root(root: &Path, path: &Path) -> bool {
+    let Some(parent) = path.parent() else { return false };
+    match std::fs::canonicalize(parent) {
+        Ok(real) => real.starts_with(root),
+        Err(_) => false,
+    }
+}
+
+/// Copy at most `cap` bytes, refusing to write one byte past it.
+fn copy_capped(reader: &mut impl Read, writer: &mut impl Write, cap: u64) -> Result<u64> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(written);
+        }
+        written = written
+            .checked_add(n as u64)
+            .ok_or_else(|| anyhow!("the update unpacks to more than the allowed size"))?;
+        if written > cap {
+            bail!("the update unpacks to more than the allowed size");
+        }
+        writer.write_all(&buf[..n])?;
+    }
 }
 
 /// Unpack the zip next to it and return the folder that holds the program.
 pub fn unpack(zip_path: &Path) -> Result<PathBuf> {
     let out = zip_path.with_extension("unpacked");
-    let _ = std::fs::remove_dir_all(&out);
+    remove_any(&out);
     std::fs::create_dir_all(&out)?;
+    let out = std::fs::canonicalize(&out)?;
+    if let Err(e) = unpack_into(zip_path, &out) {
+        remove_any(&out);
+        return Err(e);
+    }
+    find_program_dir(&out).ok_or_else(|| anyhow!("the update has no {}", exe_name()))
+}
+
+fn unpack_into(zip_path: &Path, out: &Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
     let mut zip = zip::ZipArchive::new(file).context("the update is not a readable zip")?;
+    if zip.len() > MAX_ENTRIES {
+        bail!("the update holds more than {MAX_ENTRIES} entries");
+    }
+    let mut total = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
         // `enclosed_name` refuses absolute paths and `..`: nothing may land
@@ -109,17 +281,39 @@ pub fn unpack(zip_path: &Path) -> Result<PathBuf> {
         let Some(rel) = entry.enclosed_name() else { return Err(anyhow!("the update holds an unsafe path: {}", entry.name())) };
         let dest = out.join(rel);
         if entry.is_dir() {
-            std::fs::create_dir_all(&dest)?;
+            create_dirs_under(out, &dest)?;
             continue;
         }
-        if let Some(p) = dest.parent() {
-            std::fs::create_dir_all(p)?;
+        // Symlink entries are not part of a portable build, and following
+        // one is exactly the escape this path must prevent.
+        if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
+            return Err(anyhow!("the update holds a symbolic link: {}", entry.name()));
         }
-        let mut f = std::fs::File::create(&dest)?;
-        // Reading to the end checks each file's CRC.
-        std::io::copy(&mut entry, &mut f).with_context(|| format!("unpacking {}", entry.name()))?;
+        if entry.size() > MAX_ENTRY_SIZE {
+            return Err(anyhow!("{} is larger than the {} MiB per-file limit", entry.name(), MAX_ENTRY_SIZE / (1024 * 1024)));
+        }
+        total = total
+            .checked_add(entry.size())
+            .ok_or_else(|| anyhow!("the update unpacks to more than the allowed size"))?;
+        if total > MAX_UNPACKED_TOTAL {
+            return Err(anyhow!("the update unpacks to more than {} GiB", MAX_UNPACKED_TOTAL / (1024 * 1024 * 1024)));
+        }
+        if let Some(p) = dest.parent() {
+            create_dirs_under(out, p)?;
+        }
+        if !inside_root(out, &dest) {
+            return Err(anyhow!("the update would write outside its folder: {}", dest.display()));
+        }
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&dest)?;
+        // Reading to the end checks each file's CRC; the cap also protects
+        // against a header that understates the real stream.
+        let n = copy_capped(&mut entry, &mut f, MAX_ENTRY_SIZE).with_context(|| format!("unpacking {}", entry.name()))?;
+        f.sync_all()?;
+        if n != entry.size() {
+            return Err(anyhow!("{} unpacked to {n} bytes, expected {}", entry.name(), entry.size()));
+        }
     }
-    find_program_dir(&out).ok_or_else(|| anyhow!("the update has no {}", exe_name()))
+    Ok(())
 }
 
 fn exe_name() -> &'static str {
@@ -128,23 +322,33 @@ fn exe_name() -> &'static str {
 
 /// The folder (the unpack root or one level down) holding the program.
 fn find_program_dir(root: &Path) -> Option<PathBuf> {
-    if root.join(exe_name()).is_file() {
+    if is_plain_file(&root.join(exe_name())) {
         return Some(root.to_path_buf());
     }
-    std::fs::read_dir(root).ok()?.flatten().map(|e| e.path()).find(|p| p.join(exe_name()).is_file())
+    std::fs::read_dir(root).ok()?.flatten().map(|e| e.path()).find(|p| is_plain_file(&p.join(exe_name())))
 }
 
-/// Every file under `dir`, as paths relative to it.
+/// Every regular file under `dir`, as paths relative to it. Links are
+/// refused: an update tree must not reach outside itself.
 fn files_under(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d)? {
             let p = e?.path();
-            if p.is_dir() {
+            let md = std::fs::symlink_metadata(&p)?;
+            if md.file_type().is_symlink() || is_reparse_point(&md) {
+                bail!("refusing to follow the link {}", p.display());
+            }
+            if md.is_dir() {
                 stack.push(p);
-            } else if let Ok(rel) = p.strip_prefix(dir) {
-                out.push(rel.to_path_buf());
+            } else if md.is_file() {
+                if let Ok(rel) = p.strip_prefix(dir) {
+                    out.push(rel.to_path_buf());
+                }
+                if out.len() > MAX_INSTALL_FILES {
+                    bail!("the update holds more than {MAX_INSTALL_FILES} files");
+                }
             }
         }
     }
@@ -158,33 +362,98 @@ fn old_path(p: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// A unique sibling path (the caller creates it with `create_new`).
+fn unique_sibling(path: &Path, tag: &str) -> Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().ok_or_else(|| anyhow!("{} has no parent folder", path.display()))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().replace(['/', '\\'], "_")).unwrap_or_else(|| "file".to_string());
+    for _ in 0..64 {
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let p = parent.join(format!(".{name}.{tag}-{}-{seq}-{nanos}", std::process::id()));
+        if std::fs::symlink_metadata(&p).is_err() {
+            return Ok(p);
+        }
+    }
+    bail!("could not create a temporary file next to {}", path.display())
+}
+
+/// Write a small file atomically (used for the installed-files manifest).
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = unique_sibling(path, "dctmp")?;
+    let result = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Copy the new folder over `target`, all or nothing.
 pub fn install(new_dir: &Path, target: &Path) -> Result<usize> {
-    let files = files_under(new_dir)?;
+    let new_root = std::fs::canonicalize(new_dir).context("reading the unpacked update")?;
+    let target = std::fs::canonicalize(target).context("reading the app folder")?;
+    let files = files_under(&new_root)?;
     if !files.iter().any(|f| f.as_os_str().eq_ignore_ascii_case(exe_name())) {
         return Err(anyhow!("the update has no {}", exe_name()));
     }
-    // (moved aside: original → backup) and (newly created files)
+    let mut total = 0u64;
+    for rel in &files {
+        let src = new_root.join(rel);
+        let md = std::fs::symlink_metadata(&src)?;
+        if !md.is_file() || md.file_type().is_symlink() || is_reparse_point(&md) {
+            return Err(anyhow!("the update holds an unsafe file: {}", rel.display()));
+        }
+        total = total
+            .checked_add(md.len())
+            .ok_or_else(|| anyhow!("the update is larger than the allowed size"))?;
+        if total > MAX_UNPACKED_TOTAL {
+            return Err(anyhow!("the update is larger than {} GiB", MAX_UNPACKED_TOTAL / (1024 * 1024 * 1024)));
+        }
+    }
+    // (moved aside: original → backup), installed files, staged files
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut created: Vec<PathBuf> = Vec::new();
+    let mut staged: Vec<PathBuf> = Vec::new();
     let result: Result<()> = (|| {
         for rel in &files {
             let dest = target.join(rel);
-            if let Some(p) = dest.parent() {
-                std::fs::create_dir_all(p)?;
+            if !dest.starts_with(&target) {
+                return Err(anyhow!("an update path leaves the app folder: {}", rel.display()));
             }
-            if dest.exists() {
+            if let Some(p) = dest.parent() {
+                create_dirs_under(&target, p)?;
+            }
+            if !inside_root(&target, &dest) {
+                return Err(anyhow!("the update would write through a link: {}", dest.display()));
+            }
+            // Stage the complete file next to its destination first.
+            let tmp = unique_sibling(&dest, "dcnew")?;
+            {
+                let mut src = std::fs::File::open(new_root.join(rel))?;
+                let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+                staged.push(tmp.clone());
+                copy_capped(&mut src, &mut out, MAX_ENTRY_SIZE).with_context(|| format!("staging {}", dest.display()))?;
+                out.sync_all()?;
+            }
+            if std::fs::symlink_metadata(&dest).is_ok() {
                 let bak = old_path(&dest);
                 // A backup from an earlier update that is still in use (an
                 // old program a browser started) cannot be removed: then
                 // this file is replaced without one only if that fails too.
-                if bak.exists() {
+                if std::fs::symlink_metadata(&bak).is_ok() {
                     std::fs::remove_file(&bak).with_context(|| format!("removing {}", bak.display()))?;
                 }
                 std::fs::rename(&dest, &bak).with_context(|| format!("moving {} aside", dest.display()))?;
                 moved.push((dest.clone(), bak));
             }
-            std::fs::copy(new_dir.join(rel), &dest).with_context(|| format!("writing {}", dest.display()))?;
+            std::fs::rename(&tmp, &dest).with_context(|| format!("writing {}", dest.display()))?;
             created.push(dest);
         }
         Ok(())
@@ -193,6 +462,9 @@ pub fn install(new_dir: &Path, target: &Path) -> Result<usize> {
         // Undo: the new files go, the old ones come back.
         for c in created.iter().rev() {
             let _ = std::fs::remove_file(c);
+        }
+        for s in staged.iter().rev() {
+            let _ = std::fs::remove_file(s);
         }
         for (orig, bak) in moved.iter().rev() {
             let _ = std::fs::rename(bak, orig);
@@ -204,7 +476,7 @@ pub fn install(new_dir: &Path, target: &Path) -> Result<usize> {
     for (_, bak) in &moved {
         let _ = std::fs::remove_file(bak);
     }
-    remove_dropped(target, &files);
+    remove_dropped(&target, &files);
     Ok(files.len())
 }
 
@@ -240,11 +512,16 @@ fn remove_dropped(target: &Path, files: &[PathBuf]) {
     };
     for k in old {
         // Never a path that leaves the folder, the program, or the list.
-        if new.contains(&k) || k.contains("..") || k.starts_with('/') || k == exe_name() || k == MANIFEST {
+        let safe = !k.is_empty()
+            && !k.contains("..")
+            && !k.contains([':', '\0', '\\'])
+            && !k.starts_with('/')
+            && k.split('/').all(|p| !p.is_empty() && p != ".");
+        if new.contains(&k) || !safe || k == exe_name() || k == MANIFEST {
             continue;
         }
         let p = target.join(&k);
-        if p.is_file() {
+        if is_plain_file(&p) {
             let _ = std::fs::remove_file(&p);
             // An emptied folder of the app's goes too.
             if let Some(dir) = p.parent().filter(|d| *d != target) {
@@ -254,25 +531,16 @@ fn remove_dropped(target: &Path, files: &[PathBuf]) {
     }
     let mut list: Vec<&String> = new.iter().collect();
     list.sort();
-    let _ = std::fs::write(target.join(MANIFEST), list.into_iter().map(|k| format!("{k}\n")).collect::<String>());
+    let text: String = list.into_iter().map(|k| format!("{k}\n")).collect();
+    let _ = write_atomic(&target.join(MANIFEST), text.as_bytes());
 }
 
-/// Remove `.dcold` leftovers in the app's folder (best effort, at start).
-pub fn cleanup() {
-    let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) else { return };
-    let Ok(files) = files_under(&dir) else { return };
-    for rel in files {
-        if rel.to_string_lossy().ends_with(OLD_SUFFIX) {
-            let _ = std::fs::remove_file(dir.join(rel));
-        }
-    }
-    let _ = std::fs::remove_dir_all(work_dir());
-}
+
 
 /// Start the (new) program; it waits for this process to end first.
 pub fn relaunch() -> Result<()> {
     let exe = std::env::current_exe()?;
-    std::process::Command::new(&exe)
+    crate::platform::silent_command(&exe)
         .arg("--wait-pid")
         .arg(std::process::id().to_string())
         .spawn()
@@ -308,21 +576,44 @@ pub fn wait_for_previous(args: &[String]) {
     }
 }
 
+/// Only release assets on GitHub's own HTTPS hosts are installable.
+fn trusted_update_url(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else { return false };
+    if u.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = u.host_str().map(|h| h.to_ascii_lowercase()) else { return false };
+    host == "github.com"
+        || host.ends_with(".github.com")
+        || host == "githubusercontent.com"
+        || host.ends_with(".githubusercontent.com")
+}
+
 /// The portable Windows asset of a GitHub release JSON, with its checksum.
+///
+/// Returns `None` unless the release publishes both a valid SHA-256 and a
+/// positive size: an update without them is never offered, let alone
+/// installed. `DOWNLOAD_CRAFT_UPDATE_API` is the existing end-to-end test
+/// hook and is the only way to point this at a non-GitHub URL.
 pub fn pick_asset(v: &serde_json::Value) -> Option<Asset> {
     let url = crate::model::pick_windows_asset(v)?;
+    let override_api = std::env::var("DOWNLOAD_CRAFT_UPDATE_API").map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if !override_api && !trusted_update_url(&url) {
+        return None;
+    }
     let a = v.get("assets")?.as_array()?.iter().find(|a| a.get("browser_download_url").and_then(|u| u.as_str()) == Some(url.as_str()))?;
     let sha256 = a
         .get("digest")
         .and_then(|d| d.as_str())
         .and_then(|d| d.strip_prefix("sha256:"))
-        .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
-        .map(|h| h.to_ascii_lowercase());
+        .filter(|h| valid_sha256(h))
+        .map(|h| h.to_ascii_lowercase())?;
+    let size = a.get("size").and_then(|s| s.as_u64()).filter(|&s| s > 0)?;
     Some(Asset {
         name: a.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        size: a.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+        size,
         url,
-        sha256,
+        sha256: Some(sha256),
     })
 }
 
@@ -391,10 +682,10 @@ mod tests {
         let h = "a".repeat(64);
         let v = serde_json::json!({ "assets": [
             { "name": "DownloadCraft-1.0-x86_64.AppImage", "browser_download_url": "https://x/a", "size": 1 },
-            { "name": "DownloadCraft-1.0-windows-x64-portable.zip", "browser_download_url": "https://x/p.zip", "size": 42, "digest": format!("sha256:{h}") },
+            { "name": "DownloadCraft-1.0-windows-x64-portable.zip", "browser_download_url": "https://github.com/download-craft/releases/download/v1.0/p.zip", "size": 42, "digest": format!("sha256:{h}") },
         ]});
         let a = pick_asset(&v).unwrap();
-        assert_eq!((a.url.as_str(), a.size, a.sha256.as_deref()), ("https://x/p.zip", 42, Some(h.as_str())));
+        assert_eq!((a.url.as_str(), a.size, a.sha256.as_deref()), ("https://github.com/download-craft/releases/download/v1.0/p.zip", 42, Some(h.as_str())));
     }
 
     #[test]

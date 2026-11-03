@@ -49,6 +49,7 @@ struct Behaviour {
 struct Server {
     base: String,
     b: Arc<Behaviour>,
+    ignore_ranges: AtomicBool,
     version: AtomicU64,
     active: AtomicUsize,
     peak: AtomicUsize,
@@ -63,9 +64,11 @@ impl Server {
     async fn start(b: Behaviour) -> Arc<Server> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let ignore_ranges = b.no_ranges;
         let s = Arc::new(Server {
             base,
             b: Arc::new(b),
+            ignore_ranges: AtomicBool::new(ignore_ranges),
             version: AtomicU64::new(1),
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -125,6 +128,7 @@ impl Server {
             self.requests.lock().unwrap().push(format!("{path} {range:?}"));
             let b = &self.b;
             let size = b.size;
+            let ignore_ranges = self.ignore_ranges.load(Ordering::SeqCst);
             let version = self.version.load(Ordering::SeqCst) as u8;
             if b.max_conns > 0 && self.active.load(Ordering::SeqCst) > b.max_conns {
                 sock.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n").await?;
@@ -173,7 +177,7 @@ impl Server {
             }
             let (mut start, mut end) = (0usize, size - 1);
             let mut partial = false;
-            if let (Some(r), false) = (range.as_deref(), b.no_ranges) {
+            if let (Some(r), false) = (range.as_deref(), ignore_ranges) {
                 let (a, z) = r.trim().split_once('-').unwrap();
                 start = a.parse().unwrap();
                 end = if z.is_empty() { size - 1 } else { z.parse::<usize>().unwrap().min(size - 1) };
@@ -198,7 +202,7 @@ impl Server {
             } else {
                 r.push_str("HTTP/1.1 200 OK\r\n");
             }
-            if !b.no_ranges {
+            if !ignore_ranges {
                 r.push_str("Accept-Ranges: bytes\r\n");
             }
             r.push_str(&format!("ETag: \"v{version}\"\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\n\r\n"));
@@ -431,6 +435,29 @@ async fn a_changed_file_is_not_stitched_onto_old_bytes() {
     get(&dl.clone().on_event(ev), job).await.unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), body(4 * MIB, 2));
     assert!(log.lock().unwrap().iter().any(|e| e.contains("Restarted")));
+}
+
+#[tokio::test]
+async fn a_server_that_stops_honoring_ranges_restarts_before_writing_at_a_nonzero_offset() {
+    let srv = Server::start(Behaviour { size: 4 * MIB, rate: 1024 * 1024, ..Default::default() }).await;
+    let dest = tmp("range-ignored-after-resume");
+    let dl = Downloader::new(reqwest::Client::new()).config(quick());
+    let control = Arc::new(Control::default());
+    let progress = Arc::new(Progress::default());
+    let (c, pr) = (control.clone(), progress.clone());
+    tokio::spawn(async move {
+        while pr.downloaded() < 512 * 1024 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        c.cancel();
+    });
+    let job = Job::new(srv.url("/f"), &dest).size_hint(Some(4 * MIB as u64), true);
+    assert!(matches!(dl.download(job.clone(), progress, control).await, Err(Error::Cancelled)));
+    srv.version.store(2, Ordering::SeqCst);
+    srv.ignore_ranges.store(true, Ordering::SeqCst);
+
+    get(&dl, job).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), body(4 * MIB, 2));
 }
 
 #[tokio::test]

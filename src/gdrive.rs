@@ -185,6 +185,24 @@ pub fn form_target(html: &str) -> Option<String> {
 /// Turn a Drive / Docs link into the address that serves the file itself.
 /// Anything that is not a Google link comes back unchanged.
 pub async fn resolve(client: &reqwest::Client, opts: &crate::engine::EngineOpts, url: &str) -> Result<String> {
+    resolve_inner(client, opts, url, None).await
+}
+
+pub async fn resolve_for_download(
+    client: &reqwest::Client,
+    opts: &crate::engine::EngineOpts,
+    url: &str,
+    shared: &crate::engine::SharedState,
+) -> Result<String> {
+    resolve_inner(client, opts, url, Some(shared)).await
+}
+
+async fn resolve_inner(
+    client: &reqwest::Client,
+    opts: &crate::engine::EngineOpts,
+    url: &str,
+    shared: Option<&crate::engine::SharedState>,
+) -> Result<String> {
     let link = match classify(url) {
         Some(l) => l,
         None => return Ok(url.to_string()),
@@ -208,7 +226,11 @@ pub async fn resolve(client: &reqwest::Client, opts: &crate::engine::EngineOpts,
             download_url(&id, resource_key.as_deref())
         }
     };
-    let resp = opts.get(client, &first).send().await?;
+    let response = opts.get(client, &first).send();
+    let resp = match shared {
+        Some(shared) => crate::engine::until_cancel(shared, response).await??,
+        None => response.await?,
+    };
     let status = resp.status();
     let final_host = host_of(resp.url());
     if final_host == "accounts.google.com" || status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -229,7 +251,12 @@ pub async fn resolve(client: &reqwest::Client, opts: &crate::engine::EngineOpts,
     // The virus-scan page: read it (it is small) and follow its form.
     let mut body = Vec::new();
     let mut stream = resp;
-    while let Some(chunk) = stream.chunk().await? {
+    loop {
+        let next = match shared {
+            Some(shared) => crate::engine::until_cancel(shared, stream.chunk()).await??,
+            None => stream.chunk().await?,
+        };
+        let Some(chunk) = next else { break };
         body.extend_from_slice(&chunk);
         if body.len() > 512 * 1024 {
             break;
