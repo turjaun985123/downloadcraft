@@ -2483,7 +2483,7 @@ impl Render for MainView {
         let rows = uniform_list(
             "download-rows",
             visible_indices.len(),
-            cx.processor(move |_view, range, _window, app| {
+            cx.processor(move |_view, range: std::ops::Range<usize>, _window, app| {
                 let mut rendered = Vec::with_capacity(range.len());
                 for index in range {
                     let item_index = visible_indices[index];

@@ -190,7 +190,7 @@ impl Render for GpuiConfirmView {
             .bg(rgb(0x141620)).rounded_md().border_1()
             .border_color(rgb(if focus.is_focused(window) { 0x6252c7 } else { 0x373b4b }))
             .child(if name.is_empty() { "File name".to_string() } else { name })
-            .on_mouse_down(cx.listener(move |view, _, window, _| view.filename_focus.focus(window)))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |view, _, window, _| view.filename_focus.focus(window)))
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 if key == "escape" {
