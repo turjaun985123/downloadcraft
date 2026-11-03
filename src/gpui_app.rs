@@ -2587,7 +2587,10 @@ impl Render for MainView {
             }),
         )
         .w_full()
-        .h_full();
+        .flex_1()
+        .min_h_0();
+
+        let inspected = state.items.iter().find(|item| item.selected).cloned();
 
         let content = div()
             .flex_1()
@@ -2721,6 +2724,46 @@ impl Render for MainView {
             )
             .child(rows)
             ;
+
+        let content = if let Some(item) = inspected {
+            let progress = item.progress().clamp(0.0, 1.0);
+            let progress_label = format!("{:.1}%", progress * 100.0);
+            let downloaded = model::format_bytes(item.downloaded_bytes);
+            let total = item.total_bytes.map(model::format_bytes).unwrap_or_else(|| "Unknown".into());
+            let speed = if item.speed_bps > 0.0 {
+                model::format_speed(item.speed_bps)
+            } else {
+                "—".into()
+            };
+            let eta = if item.status.is_active() { model::format_eta(&item) } else { "—".into() };
+            let destination = item.dest_path().to_string_lossy().into_owned();
+            let inspector = div()
+                .id("download-inspector")
+                .flex_none()
+                .w_full()
+                .p_3()
+                .bg(rgb(card_color()))
+                .border_1()
+                .border_color(rgb(button_color()))
+                .rounded_sm()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().flex().items_center().justify_between()
+                    .child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child(item.filename.clone()))
+                    .child(div().text_xs().text_color(rgb(muted_color())).child(item.status.label())))
+                .child(div().h(px(4.0)).w_full().bg(rgb(button_color())).rounded_sm()
+                    .child(div().h_full().w(px(500.0 * progress)).bg(rgb(accent_color())).rounded_sm()))
+                .child(div().flex().items_center().gap_4().text_xs().font_family("monospace").text_color(rgb(muted_color()))
+                    .child(format!("{downloaded} / {total}"))
+                    .child(format!("{progress_label} complete"))
+                    .child(speed)
+                    .child(format!("ETA {eta}")))
+                .child(div().text_xs().text_color(rgb(muted_color())).child(destination));
+            content.child(inspector)
+        } else {
+            content
+        };
 
         div()
             .size_full()
