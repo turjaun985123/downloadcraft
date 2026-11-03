@@ -155,6 +155,7 @@ struct Run {
     last_progress: Mutex<Instant>,
     fatal: Mutex<Option<Error>>,
     stop: AtomicBool,
+    stop_tx: tokio::sync::watch::Sender<bool>,
     refreshes: AtomicU32,
     refreshed: AtomicBool,
     refresh_lock: tokio::sync::Mutex<()>,
@@ -178,6 +179,24 @@ impl Run {
         self.stop.load(Ordering::SeqCst) || self.control.is_cancelled()
     }
 
+    /// Wake workers when either the user cancels or this run reaches a fatal
+    /// error. Fatal errors must not mutate the caller's user-facing Control:
+    /// `run` uses that distinction to decide whether a changed file can be
+    /// safely restarted from an empty partial.
+    async fn cancelled(&self) {
+        if self.stopping() {
+            return;
+        }
+        let mut stop = self.stop_tx.subscribe();
+        if *stop.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = self.control.cancelled() => {},
+            _ = stop.changed() => {},
+        }
+    }
+
     fn set_fatal(&self, e: Error) {
         let mut g = lock(&self.fatal);
         if g.is_none() {
@@ -186,7 +205,7 @@ impl Run {
         self.stop.store(true, Ordering::SeqCst);
         // Wake requests, response streams, pauses and retry sleeps so the
         // other workers can flush their current buffers and stop promptly.
-        self.control.cancel();
+        self.stop_tx.send_replace(true);
     }
 
     /// Leave when more connections run than allowed (the live count drops
@@ -230,7 +249,7 @@ impl Run {
         let until = Instant::now() + d;
         while Instant::now() < until && !self.stopping() && !self.control.is_paused() {
             tokio::select! {
-                _ = self.control.cancelled() => return,
+                _ = self.cancelled() => return,
                 _ = self.control.pause_changed() => return,
                 _ = tokio::time::sleep(Duration::from_millis(150).min(until - Instant::now())) => {}
             }
@@ -537,6 +556,7 @@ async fn run_once(
         last_progress: Mutex::new(Instant::now()),
         fatal: Mutex::new(None),
         stop: AtomicBool::new(false),
+        stop_tx: tokio::sync::watch::channel(false).0,
         refreshes: AtomicU32::new(0),
         refreshed: AtomicBool::new(false),
         refresh_lock: tokio::sync::Mutex::new(()),
@@ -619,12 +639,12 @@ async fn monitor(run: Arc<Run>) -> Result<Outcome, Error> {
         }
         if set.is_empty() {
             tokio::select! {
-                _ = run.control.cancelled() => {},
+                _ = run.cancelled() => {},
                 _ = tokio::time::sleep(TICK) => {}
             }
         } else {
             tokio::select! {
-                _ = run.control.cancelled() => {},
+                _ = run.cancelled() => {},
                 _ = tokio::time::sleep(TICK) => {},
                 _ = set.join_next() => {},
             }
@@ -754,7 +774,7 @@ async fn worker(run: Arc<Run>, w: usize) {
     let stat = lock(&run.stats)[w].clone();
     let _permit = match &run.dl.gate {
         Some(g) => tokio::select! {
-            _ = run.control.cancelled() => return,
+            _ = run.cancelled() => return,
             permit = g.clone().acquire_owned() => permit.ok(),
         },
         None => None,
@@ -845,7 +865,7 @@ async fn worker(run: Arc<Run>, w: usize) {
             }
             Err(Fail::Refused { status, url }) => {
                 let result = tokio::select! {
-                    _ = run.control.cancelled() => { interrupted = Some(Fail::Cancelled); None },
+                    _ = run.cancelled() => { interrupted = Some(Fail::Cancelled); None },
                     _ = run.control.pause_changed() => { interrupted = Some(Fail::Paused); None },
                     result = run.on_refused(w, status, &url) => Some(result),
                 };
@@ -902,7 +922,7 @@ async fn fetch(
     let send = (run.dl.request)(&url).header(reqwest::header::RANGE, range).send();
     let answer = if run.others_healthy(w) { cfg.stall_timeout.min(BUSY_ANSWER) } else { cfg.stall_timeout };
     let resp = match tokio::select! {
-        _ = run.control.cancelled() => return Err(Fail::Cancelled),
+        _ = run.cancelled() => return Err(Fail::Cancelled),
         _ = run.control.pause_changed() => return Err(Fail::Paused),
         result = tokio::time::timeout(answer, send) => result,
     } {
@@ -1051,7 +1071,7 @@ async fn fetch(
             break Ok(End::Restart);
         }
         let chunk = match tokio::select! {
-            _ = run.control.cancelled() => break Err(Fail::Cancelled),
+            _ = run.cancelled() => break Err(Fail::Cancelled),
             _ = run.control.pause_changed() => break Err(Fail::Paused),
             result = tokio::time::timeout(cfg.stall_timeout, stream.next()) => result,
         } {
@@ -1083,7 +1103,7 @@ async fn fetch(
             *lock(&stat.last_byte) = Some(Instant::now());
             if let Some(l) = &run.dl.limiter {
                 tokio::select! {
-                    _ = run.control.cancelled() => break Err(Fail::Cancelled),
+                    _ = run.cancelled() => break Err(Fail::Cancelled),
                     _ = run.control.pause_changed() => break Err(Fail::Paused),
                     _ = l.consume(acc as u64) => {},
                 }
