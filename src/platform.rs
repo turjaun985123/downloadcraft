@@ -7,7 +7,10 @@ use std::process::Command;
 /// Construct a child process without opening a console window on Windows.
 /// Use this for helpers and OS integration commands launched by the GUI.
 pub fn silent_command(program: impl AsRef<OsStr>) -> Command {
+    #[cfg(windows)]
     let mut command = Command::new(program);
+    #[cfg(not(windows))]
+    let command = Command::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -203,17 +206,17 @@ pub fn play_sound_file(event: &str, file: &str) {
     }
 }
 
-pub fn power(action: &str) -> Result<(), String> {
+pub fn power(_action: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut command = {
-        let mut c = silent_command(if action == "sleep" {
+        let mut c = silent_command(if _action == "sleep" {
             "pmset"
         } else {
             "osascript"
         });
-        if action == "sleep" {
+        if _action == "sleep" {
             c.arg("sleepnow");
-        } else if action == "shutdown" {
+        } else if _action == "shutdown" {
             c.args(["-e", "tell application \"System Events\" to shut down"]);
         } else {
             return Err("Hibernation is not offered by this macOS build".into());
@@ -223,7 +226,7 @@ pub fn power(action: &str) -> Result<(), String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut command = {
         let mut c = silent_command("systemctl");
-        c.arg(match action {
+        c.arg(match _action {
             "shutdown" => "poweroff",
             "sleep" => "suspend",
             "hibernate" => "hibernate",

@@ -982,6 +982,12 @@ fn push_loop() {
             }
         }
         first = false;
+        if last_cleanup.elapsed() >= std::time::Duration::from_secs(60) {
+            if let Some(dir) = page_fetch_dir() {
+                cleanup_page_fetch_dir(&dir);
+            }
+            last_cleanup = std::time::Instant::now();
+        }
         // Page-fetch requests the app is waiting on.
         let now = std::time::Instant::now();
         asked.retain(|_, requested_at| now.duration_since(*requested_at) < FETCH_REQUEST_TTL);

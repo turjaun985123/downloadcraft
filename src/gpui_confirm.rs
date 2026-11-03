@@ -260,7 +260,7 @@ pub fn run_gpui() {
             cx.new(|cx| GpuiConfirmView { app, _confirm_slot: _slot, filename_focus: cx.focus_handle(), capture: None, capture_acknowledged: false })
         }).expect("open GPUI confirmation window");
         let refresh = window.clone();
-        cx.spawn(async move |mut cx| loop {
+        cx.spawn(async move |cx| loop {
             Timer::after(Duration::from_millis(200)).await;
             if refresh.update(cx, |view, window, cx| { view.tick(); if view.is_done() { window.remove_window(); } else { cx.notify(); } }).is_err() { break; }
         }).detach();

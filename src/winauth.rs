@@ -8,6 +8,7 @@
 
 use crate::engine::{EngineOpts, SharedState};
 use anyhow::{anyhow, Result};
+#[cfg(windows)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 

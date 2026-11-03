@@ -1761,7 +1761,7 @@ fn open_managed_about(manager: &Entity<DownloadManagerStore>, cx: &mut App) {
         move |_, cx| cx.new(|_| initial),
     ) else { return };
     let refresh_window = window;
-    cx.spawn(async move |mut cx| loop {
+    cx.spawn(async move |cx| loop {
         Timer::after(Duration::from_millis(400)).await;
         if refresh_window.update(cx, |view, native_window, cx| {
             view.refresh();
@@ -1799,7 +1799,7 @@ fn open_managed_settings(manager: &Entity<DownloadManagerStore>, cx: &mut App, p
         },
     ) else { return };
     let refresh_window = window;
-    cx.spawn(async move |mut cx| loop {
+    cx.spawn(async move |cx| loop {
         Timer::after(Duration::from_millis(500)).await;
         if refresh_window.update(cx, |_view, native_window, cx| {
             cx.notify();
@@ -1840,7 +1840,7 @@ fn open_managed_setup(manager: &Entity<DownloadManagerStore>, cx: &mut App, auto
         move |_, cx| cx.new(|_| SetupView { data: data_for_view }),
     ) else { return };
     let refresh_window = window;
-    cx.spawn(async move |mut cx| loop {
+    cx.spawn(async move |cx| loop {
         Timer::after(Duration::from_millis(300)).await;
         if refresh_window.update(cx, |view, native_window, cx| {
             view.poll();
@@ -1913,7 +1913,7 @@ fn open_managed_progress(manager: &Entity<DownloadManagerStore>, cx: &mut App, i
         },
         move |_, cx| cx.new(|_| view),
     ) else { return };
-    cx.spawn(async move |mut cx| loop {
+    cx.spawn(async move |cx| loop {
         Timer::after(Duration::from_millis(250)).await;
         if window.update(cx, |view, native_window, cx| {
             view.refresh();
@@ -1947,7 +1947,7 @@ fn open_managed_complete(manager: &Entity<DownloadManagerStore>, cx: &mut App, i
         },
         move |_, cx| cx.new(|_| view),
     ) else { return };
-    cx.spawn(async move |mut cx| loop {
+    cx.spawn(async move |cx| loop {
         Timer::after(Duration::from_millis(500)).await;
         if window.update(cx, |_view, native_window, cx| {
             cx.notify();
@@ -1971,7 +1971,7 @@ fn open_managed_mini(manager: &Entity<DownloadManagerStore>, cx: &mut App) {
         },
         move |_, cx| cx.new(|_| initial),
     ) else { return };
-    cx.spawn(async move |mut cx| loop {
+    cx.spawn(async move |cx| loop {
         Timer::after(Duration::from_secs(1)).await;
         if window.update(cx, |view, native_window, cx| {
             view.refresh();
@@ -2000,7 +2000,7 @@ fn open_managed_basket(manager: &Entity<DownloadManagerStore>, cx: &mut App) {
         },
         move |_, cx| cx.new(|_| BasketView { state: state_for_view }),
     ) else { return };
-    cx.spawn(async move |mut cx| loop {
+    cx.spawn(async move |cx| loop {
         Timer::after(Duration::from_secs(2)).await;
         if window.update(cx, |view, native_window, cx| {
             view.reload();
@@ -3107,7 +3107,7 @@ impl Render for SettingsView {
 }
 
 impl Render for SetupView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let (states, busy, show_at_start, missing) = {
             let data = self.data.lock().unwrap_or_else(|error| error.into_inner());
             (data.states.clone(), data.busy, data.show_at_start, Self::missing_automatic(&data))
@@ -3539,7 +3539,7 @@ pub fn run(runtime: Arc<tokio::runtime::Runtime>) {
             .expect("open Download Craft GPUI window");
 
         let refresh_manager = manager.clone();
-        cx.spawn(async move |mut cx| {
+        cx.spawn(async move |cx| {
             let mut last_heartbeat = Instant::now();
             loop {
                 Timer::after(Duration::from_millis(100)).await;
@@ -3607,7 +3607,7 @@ pub fn run_about() {
                 move |_, cx| cx.new(|_| initial),
             )
             .expect("open Download Craft About window");
-        cx.spawn(async move |mut cx| loop {
+        cx.spawn(async move |cx| loop {
             Timer::after(Duration::from_millis(400)).await;
             if window
                 .update(cx, |view, native_window, cx| {
@@ -3670,7 +3670,7 @@ pub fn run_settings() {
                 },
             )
             .expect("open Download Craft Settings GPUI window");
-        cx.spawn(async move |mut cx| loop {
+        cx.spawn(async move |cx| loop {
             Timer::after(Duration::from_millis(500)).await;
             if window
                 .update(cx, |_view, native_window, cx| {
@@ -3721,7 +3721,7 @@ pub fn run_setup() {
                 move |_, cx| cx.new(|_| SetupView { data }),
             )
             .expect("open Download Craft setup GPUI window");
-        cx.spawn(async move |mut cx| loop {
+        cx.spawn(async move |cx| loop {
             Timer::after(Duration::from_millis(300)).await;
             if window
                 .update(cx, |view, native_window, cx| {
@@ -3772,7 +3772,7 @@ pub fn run_progress() {
                 move |_, cx| cx.new(|_| view),
             )
             .expect("open Download Craft Progress GPUI window");
-        cx.spawn(async move |mut cx| loop {
+        cx.spawn(async move |cx| loop {
             Timer::after(Duration::from_millis(250)).await;
             if window
                 .update(cx, |view, native_window, cx| {
@@ -3837,7 +3837,7 @@ pub fn run_complete() {
                 move |_, cx| cx.new(|_| view),
             )
             .expect("open Download Craft Completion GPUI window");
-        cx.spawn(async move |mut cx| loop {
+        cx.spawn(async move |cx| loop {
             Timer::after(Duration::from_millis(500)).await;
             if window
                 .update(cx, |_view, native_window, cx| {
@@ -3874,7 +3874,7 @@ pub fn run_mini() {
                 move |_, cx| cx.new(|_| initial),
             )
             .expect("open Download Craft Mini window");
-        cx.spawn(async move |mut cx| loop {
+        cx.spawn(async move |cx| loop {
             Timer::after(Duration::from_secs(1)).await;
             if window
                 .update(cx, |view, native_window, cx| {
@@ -3914,7 +3914,7 @@ pub fn run_basket() {
                 move |_, cx| cx.new(|_| BasketView { state: state_for_view }),
             )
             .expect("open Download Craft Drop Basket window");
-        cx.spawn(async move |mut cx| loop {
+        cx.spawn(async move |cx| loop {
             Timer::after(Duration::from_secs(2)).await;
             if window
                 .update(cx, |view, native_window, cx| {

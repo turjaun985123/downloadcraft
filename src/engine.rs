@@ -1208,7 +1208,7 @@ fn is_final_http_error(e: &anyhow::Error) -> bool {
 /// Saturating counter decrement (plain `fetch_sub` wraps to u64::MAX on
 /// underflow — which once painted a stuck-full progress bar).
 fn sub_saturating(a: &std::sync::atomic::AtomicU64, n: u64) {
-    a.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(n)))
+    a.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(n)))
         .ok();
 }
 
@@ -5043,7 +5043,6 @@ async fn download_inner(
     // throttle or botch parallel Range requests (FB/IG CDN class).
     let mut retried_fresh = false;
     let mut fell_back_single = fragile_cdn;
-    let mut last_segmented = false;
     loop {
         // googlevideo's strict ~2 MiB window is a per-request limit inside
         // the segmented engine (`max_request`), not a smaller split.
@@ -5054,7 +5053,6 @@ async fn download_inner(
             && matches!(total_opt, Some(t) if t >= 1024 * 1024)
             && (seg_parts > 1 || has_partial(&dest))
             && !fell_back_single;
-        last_segmented = use_segmented;
         let r = if use_segmented {
             segmented(
                 &client,
@@ -5090,7 +5088,7 @@ async fn download_inner(
             Ok(()) => {
                 // A plain-stream fallback finished: the engine's partial
                 // data (kept in case that failed too) is no longer needed.
-                if !last_segmented {
+                if !use_segmented {
                     remove_partial(&dest);
                 }
                 break;
@@ -5140,7 +5138,7 @@ async fn download_inner(
             }
             Err(e)
                 if !fell_back_single
-                    && last_segmented
+                    && use_segmented
                     && (is_final_http_error(&e)
                         || segmented_throttled(&e.to_string())) =>
             {
@@ -5195,15 +5193,19 @@ async fn download_inner(
 
 /// Include common Unix tool locations when launched from a Dock or desktop.
 fn tool_dirs() -> Vec<std::path::PathBuf> {
-    let mut paths: Vec<_> = std::env::var_os("PATH").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default();
+    let paths: Vec<_> = std::env::var_os("PATH")
+        .map(|v| std::env::split_paths(&v).collect())
+        .unwrap_or_default();
     #[cfg(unix)]
-    {
+    let paths = {
+        let mut paths = paths;
         for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
             let p = std::path::PathBuf::from(dir);
             if !paths.contains(&p) { paths.push(p); }
         }
         if let Some(h) = dirs::home_dir() { paths.push(h.join(".local/bin")); }
-    }
+        paths
+    };
     paths
 }
 
@@ -8929,14 +8931,13 @@ async fn chunked_stream(
                             *slot = 0;
                         }
                     }
-                    if let (t, _, _, _) = probe_live(client, opts, url, shared.as_ref()).await? {
-                        if let Some(t) = t {
-                            total = t;
-                            shared.total.store(t, Ordering::SeqCst);
-                            shared.has_total.store(true, Ordering::SeqCst);
-                            // Rebind resume state to the refreshed total.
-                            write_resume_meta(dest, url, Some(t), 1);
-                        }
+                    let (t, _, _, _) = probe_live(client, opts, url, shared.as_ref()).await?;
+                    if let Some(t) = t {
+                        total = t;
+                        shared.total.store(t, Ordering::SeqCst);
+                        shared.has_total.store(true, Ordering::SeqCst);
+                        // Rebind resume state to the refreshed total.
+                        write_resume_meta(dest, url, Some(t), 1);
                     }
                     stalled = 0;
                     continue;
