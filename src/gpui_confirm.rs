@@ -5,7 +5,7 @@ use crate::confirm_core::{build_confirm_app, ConfirmApp, NOT_RUNNING, START_WAIT
 use crate::engine::{self};
 use crate::model::{category_of, filename_from_url, is_download_url};
 use gpui::prelude::*;
-use gpui::{div, px, rgb, size, Application, Bounds, FocusHandle, SharedString, Timer, TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions};
+use gpui::{div, px, rgb, size, Application, Bounds, FocusHandle, SharedString, Timer, TitlebarOptions, Window, WindowBounds, WindowOptions};
 use std::time::Duration;
 
 pub(crate) struct GpuiConfirmView {
@@ -249,18 +249,21 @@ pub fn run_gpui() {
         cx.on_window_closed(|cx| { if cx.windows().is_empty() { cx.quit(); } }).detach();
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some((app, runtime))));
         let state_for_window = state.clone();
-        let bounds = Bounds::centered(None, size(px(600.0), px(420.0)), cx);
+        let bounds = Bounds::centered(None, size(px(520.0), px(380.0)), cx);
         let window = cx.open_window(WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
                 title: Some(SharedString::from("Add download")),
                 ..Default::default()
             }),
-            kind: WindowKind::PopUp,
-            // Keep server-side decorations so the window manager supplies its
-            // normal title bar, move handle, and caption buttons.
+            // A normal window is required here: GPUI popup windows are
+            // tool/notification windows on Windows and X11, which suppress
+            // the OS titlebar controls regardless of the titlebar option.
+            kind: gpui::WindowKind::Normal,
             is_resizable: true,
             is_movable: true,
+            is_minimizable: true,
+            window_decorations: Some(gpui::WindowDecorations::Server),
             ..Default::default()
         }, move |_, cx| {
             let (app, runtime) = state_for_window.lock().unwrap_or_else(|e| e.into_inner()).take().expect("confirmation state");
